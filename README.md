@@ -1,0 +1,54 @@
+# 离线人物识别实验
+
+这里是从 `touzhi_service` 复制出来的独立离线实验程序。它逐帧读取视频，使用三姿态 YOLO 模型检测人物，并结合卡尔曼滤波、动态裁剪和重新捕获策略，生成带标注的输出视频。此目录不依赖原仓库、实时相机进程或 Web 服务。
+
+## 安装与运行
+
+在 PowerShell 中进入本目录并安装依赖：
+
+```powershell
+cd D:\detect\_test
+uv sync
+```
+
+处理任意本地视频。`models/best.pt` 已随实验目录复制，默认输出为 `outputs/输入文件名-tracked.mp4`：
+
+```powershell
+uv run python -m person_tracking --input 'D:\path\to\video.mp4'
+```
+
+处理时默认实时显示已标注画面；按 `Q` 或 `Esc` 可提前结束。没有桌面窗口时使用 `--no-display`：
+
+```powershell
+uv run python -m person_tracking --input 'D:\path\to\video.mp4' --no-display
+```
+
+可以指定输出、其他模型和推理设备：
+
+```powershell
+uv run python -m person_tracking `
+  --input 'D:\path\to\video.mp4' `
+  --output 'outputs\trial-01.mp4' `
+  --model 'models\best.pt' `
+  --device cpu `
+  --no-display
+```
+
+## 调整策略
+
+所有处理参数可用 `uv run python -m person_tracking --help` 查看。常用参数：
+
+| 参数 | 用途 | 默认值 |
+|---|---|---:|
+| `--prediction-frames` | 两次局部模型检测之间只使用卡尔曼预测的帧数；设为 `0` 可每帧检测 | 5 |
+| `--warmup-detections` | 初始阶段连续检测成功次数 | 4 |
+| `--confidence` | 模型置信度阈值 | 0.25 |
+| `--imgsz` | 全局检测输入尺寸 | 640 |
+| `--local-imgsz` | 动态裁剪后检测输入尺寸 | 384 |
+| `--roi-y-min` / `--roi-y-max` | 人物搜索区域的上下边界，单位为像素；默认整个画面 | 0 / 视频底部 |
+| `--crop-min-size` / `--crop-max-size` | 动态裁剪尺寸范围，单位为像素 | 320 / 800 |
+| `--recovery-misses` | 局部检测连续漏检后切回全局搜索的次数 | 3 |
+| `--global-recovery-ms` | 无成功测量后切回全局搜索的时间，单位为毫秒 | 300 |
+| `--max-prediction-ms` | 最长绘制纯预测框的时间，单位为毫秒 | 500 |
+
+处理逻辑集中在 `person_tracking/engine.py`，模型调用在 `person_tracking/detector.py`，运动预测在 `person_tracking/kalman.py`；可以直接在这里修改策略，不会影响服务中的代码。输出视频保留输入帧率和尺寸，但不包含原视频音轨。模型权重和生成的视频请勿提交到 Git。

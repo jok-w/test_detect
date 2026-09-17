@@ -1,0 +1,169 @@
+import argparse
+import logging
+from pathlib import Path
+
+from .processor import (
+    PersonVideoProcessor,
+    ProcessorConfig,
+)
+
+
+DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "models" / "best.pt"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """
+    作用：构建独立人物视频处理命令行参数解析器。
+    返回：配置完成的 argparse 参数解析器。
+    """
+    parser = argparse.ArgumentParser(
+        description=("逐帧使用 YOLO11n 三姿态模型和卡尔曼滤波生成人物框标注视频")
+    )
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="YOLO11n 权重路径")
+    parser.add_argument("--input", type=Path, required=True, help="输入视频路径")
+    parser.add_argument("--output", type=Path, default=None, help="输出视频路径；默认保存到 outputs 目录")
+    parser.add_argument(
+        "--warmup-detections",
+        type=int,
+        choices=(3, 4),
+        default=4,
+        help="启动阶段连续成功模型检测次数，默认 4",
+    )
+    parser.add_argument(
+        "--prediction-frames",
+        type=int,
+        default=5,
+        help="局部模型检测之间的卡尔曼纯预测帧数，默认 5；设为 0 时每帧局部检测",
+    )
+    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--imgsz", type=int, default=None)
+    parser.add_argument(
+        "--local-imgsz",
+        type=int,
+        default=None,
+        help="动态裁剪区域的模型输入尺寸，默认 384",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Ultralytics 设备参数，例如 cpu、0；为空时自动选择",
+    )
+    parser.add_argument("--roi-y-min", type=int, default=None)
+    parser.add_argument(
+        "--roi-y-max",
+        type=int,
+        default=None,
+        help="固定人物纵向区域终点；为空时使用视频底部",
+    )
+    parser.add_argument("--codec", default="mp4v")
+    parser.add_argument("--max-prediction-ms", type=float, default=500.0)
+    parser.add_argument("--global-recovery-ms", type=float, default=300.0)
+    parser.add_argument("--recovery-misses", type=int, default=3)
+    parser.add_argument("--recovery-detections", type=int, default=2)
+    parser.add_argument("--crop-min-size", type=int, default=320)
+    parser.add_argument("--crop-max-size", type=int, default=800)
+    parser.add_argument(
+        "--crop-person-height-ratio",
+        type=float,
+        default=0.60,
+    )
+    parser.add_argument(
+        "--crop-person-width-ratio",
+        type=float,
+        default=0.35,
+    )
+    parser.add_argument("--crop-center-smoothing", type=float, default=0.30)
+    parser.add_argument("--crop-size-smoothing", type=float, default=0.20)
+    parser.add_argument(
+        "--crop-max-size-change-ratio",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument("--crop-edge-margin-ratio", type=float, default=0.08)
+    parser.add_argument(
+        "--display",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="每处理完成一帧立即显示；使用 --no-display 可关闭窗口",
+    )
+    return parser
+
+
+def build_config(
+    arguments: argparse.Namespace,
+) -> ProcessorConfig:
+    """
+    作用：将离线视频命令行参数转换为处理配置。
+    参数：
+        arguments：argparse 解析得到的命令行参数。
+    返回：可以交给人物视频处理器的完整配置。
+    """
+    input_path = arguments.input
+    output_path = arguments.output or Path("outputs") / f"{input_path.stem}-tracked.mp4"
+    return ProcessorConfig(
+        model_path=arguments.model,
+        input_path=input_path,
+        output_path=output_path,
+        warmup_detections=arguments.warmup_detections,
+        prediction_frames=arguments.prediction_frames,
+        confidence=arguments.confidence,
+        iou_threshold=arguments.iou,
+        image_size=arguments.imgsz if arguments.imgsz is not None else 640,
+        local_image_size=arguments.local_imgsz if arguments.local_imgsz is not None else 384,
+        device=arguments.device,
+        roi_y_min=arguments.roi_y_min if arguments.roi_y_min is not None else 0,
+        roi_y_max=arguments.roi_y_max,
+        codec=arguments.codec,
+        max_prediction_ms=arguments.max_prediction_ms,
+        global_recovery_ms=arguments.global_recovery_ms,
+        recovery_misses=arguments.recovery_misses,
+        recovery_detections=arguments.recovery_detections,
+        crop_min_size=arguments.crop_min_size,
+        crop_max_size=arguments.crop_max_size,
+        crop_person_height_ratio=arguments.crop_person_height_ratio,
+        crop_person_width_ratio=arguments.crop_person_width_ratio,
+        crop_center_smoothing=arguments.crop_center_smoothing,
+        crop_size_smoothing=arguments.crop_size_smoothing,
+        crop_max_size_change_ratio=arguments.crop_max_size_change_ratio,
+        crop_edge_margin_ratio=arguments.crop_edge_margin_ratio,
+        display=arguments.display,
+    )
+
+
+def main() -> int:
+    """
+    作用：解析命令行参数并执行独立人物视频处理任务。
+    返回：处理成功时返回进程退出码 0。
+    副作用：加载模型、读取输入视频并生成标注输出视频。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    parser = build_parser()
+    arguments = parser.parse_args()
+    config = build_config(arguments)
+    stats = PersonVideoProcessor(config).process()
+    logging.getLogger(__name__).info(
+        "视频处理完成：处理帧数=%s，同步写入帧数=%s，模型帧数=%s，"
+        "全局模型帧数=%s，局部模型帧数=%s，卡尔曼预测帧数=%s，"
+        "无人物框帧数=%s，平均单帧耗时=%.2fms，"
+        "等效处理速度=%.2ffps，用户提前停止=%s，输出=%s",
+        stats.total_frames,
+        stats.written_frames,
+        stats.model_frames,
+        stats.global_model_frames,
+        stats.local_model_frames,
+        stats.kalman_only_frames,
+        stats.frames_without_box,
+        stats.average_frame_time_ms,
+        stats.average_processing_fps,
+        stats.stopped_by_user,
+        stats.output_path,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
