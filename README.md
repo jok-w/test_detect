@@ -11,6 +11,14 @@ cd D:\detect\_test
 uv sync
 ```
 
+`pyproject.toml` 显式固定 `torch 2.14.0` 和 `torchvision 0.29.0`。在 Linux 或 Windows 上，`uv` 会从 PyTorch 的 CUDA 12.6 索引安装对应构建；GPU 平台需提供兼容 CUDA 12.6 的 NVIDIA 驱动。部署后可检查安装结果：
+
+```powershell
+uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+运行时如需指定首张 GPU，使用 `--device 0`。
+
 处理任意本地视频。`models/best.pt` 已随实验目录复制，默认输出为 `outputs/输入文件名-tracked.mp4`：
 
 ```powershell
