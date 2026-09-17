@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 
 import cv2
 import numpy as np
@@ -8,7 +9,7 @@ import numpy as np
 from .detector import YoloPersonDetector
 from .kalman import BoundingBoxKalmanFilter
 from .tracking_config import PersonTrackingConfig
-from .types import BoundingBox, CropWindow, PersonDetection
+from .types import BoundingBox, CropWindow, PersonDetection, bbox_iou
 
 
 @dataclass(frozen=True)
@@ -341,32 +342,80 @@ class PersonTrackingEngine:
         roi_y_max: int,
     ) -> PersonDetection | None:
         """
-        作用：在固定纵向 ROI 内运行较大输入尺寸模型并选择唯一受训人员。
+        作用：将固定纵向 ROI 分片检测，映射并去重后选择唯一受训人员。
         参数：
             frame：当前原始视频帧。
             predicted_bbox：可靠时用于筛选候选框的卡尔曼预测框。
             roi_y_max：固定纵向人物区域的结束像素坐标。
         返回：恢复到原始画面坐标的唯一人物检测；未检测到时返回 None。
-        副作用：执行一次 YOLO11n 全局模型推理。
+        副作用：按批次执行 YOLO11n 全局分片推理。
         """
-        roi_frame = frame[self.config.roi_y_min : roi_y_max, :]
-        roi_detections = self.detector.detect(
-            roi_frame,
-            image_size=self.config.image_size,
-        )
-        detections = [
-            PersonDetection(
-                bbox=detection.bbox.shifted(y_offset=self.config.roi_y_min),
-                confidence=detection.confidence,
-                class_id=detection.class_id,
-                class_name=detection.class_name,
+        tile_size = self.config.global_tile_size
+        overlap = self.config.global_tile_overlap
+        frame_width = frame.shape[1]
+        roi_height = roi_y_max - self.config.roi_y_min
+        tile_width = min(tile_size, frame_width)
+        tile_height = min(tile_size, roi_height)
+        x_starts = self._tile_starts(frame_width, tile_width, overlap)
+        y_starts = self._tile_starts(roi_height, tile_height, overlap)
+        windows = [
+            CropWindow(
+                x1=x,
+                y1=self.config.roi_y_min + y,
+                x2=x + tile_width,
+                y2=self.config.roi_y_min + y + tile_height,
             )
-            for detection in roi_detections
+            for y in y_starts
+            for x in x_starts
         ]
+        detections: list[PersonDetection] = []
+        batch_size = self.config.global_tile_batch_size
+        for offset in range(0, len(windows), batch_size):
+            batch_windows = windows[offset : offset + batch_size]
+            batch_frames = [
+                frame[window.y1 : window.y2, window.x1 : window.x2]
+                for window in batch_windows
+            ]
+            batch_detections = self.detector.detect_batch(
+                batch_frames,
+                image_size=self.config.image_size,
+            )
+            for window, tile_detections in zip(batch_windows, batch_detections):
+                detections.extend(
+                    PersonDetection(
+                        bbox=detection.bbox.shifted(window.x1, window.y1),
+                        confidence=detection.confidence,
+                        class_id=detection.class_id,
+                        class_name=detection.class_name,
+                    )
+                    for detection in tile_detections
+                )
         return self.detector.select_single_person(
-            detections=detections,
+            detections=self._deduplicate_detections(
+                detections, self.config.iou_threshold,
+            ),
             predicted_bbox=predicted_bbox,
         )
+
+    @staticmethod
+    def _tile_starts(length: int, tile_size: int, overlap: int) -> list[int]:
+        """平均分布分片，保证覆盖边缘且相邻分片至少重叠指定像素。"""
+        if length <= tile_size:
+            return [0]
+        count = ceil((length - tile_size) / (tile_size - overlap)) + 1
+        return [round(index * (length - tile_size) / (count - 1)) for index in range(count)]
+
+    @staticmethod
+    def _deduplicate_detections(
+        detections: list[PersonDetection],
+        iou_threshold: float,
+    ) -> list[PersonDetection]:
+        """跨分片执行不区分类别的置信度优先 NMS。"""
+        selected: list[PersonDetection] = []
+        for detection in sorted(detections, key=lambda item: item.confidence, reverse=True):
+            if all(bbox_iou(detection.bbox, kept.bbox) <= iou_threshold for kept in selected):
+                selected.append(detection)
+        return selected
 
 
     def _detect_local_person(

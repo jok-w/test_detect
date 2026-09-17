@@ -52,11 +52,16 @@ uv run python -m person_tracking `
 | `--warmup-detections` | 初始阶段连续检测成功次数 | 4 |
 | `--confidence` | 模型置信度阈值 | 0.25 |
 | `--imgsz` | 全局检测输入尺寸 | 640 |
+| `--global-tile-size` | 全局搜索分片在原图中的边长，单位为像素 | 640 |
+| `--global-tile-overlap` | 相邻全局分片的最小重叠，单位为像素 | 128 |
+| `--global-tile-batch-size` | 每批送入模型的全局分片数量 | 4 |
 | `--local-imgsz` | 动态裁剪后检测输入尺寸 | 384 |
 | `--roi-y-min` / `--roi-y-max` | 人物搜索区域的上下边界，单位为像素；默认整个画面 | 0 / 视频底部 |
 | `--crop-min-size` / `--crop-max-size` | 动态裁剪尺寸范围，单位为像素 | 320 / 800 |
 | `--recovery-misses` | 局部检测连续漏检后切回全局搜索的次数 | 3 |
 | `--global-recovery-ms` | 无成功测量后切回全局搜索的时间，单位为毫秒 | 300 |
 | `--max-prediction-ms` | 最长绘制纯预测框的时间，单位为毫秒 | 500 |
+
+全局搜索（首次捕获、预热和丢失后重捕获）现在会对固定纵向 ROI 分片推理。默认 640×640 原图像素分片、至少重叠 128 像素；3840×2160 且搜索区域为整帧时共 8 列×4 行，即 32 个分片，分 8 批运行。检测框会映射回原始画面坐标，并进行跨分片去重。局部跟踪仍使用卡尔曼预测的动态裁剪。若画面中的人高于约 640 像素，可增大 `--global-tile-size`，模型仍会把该分片缩放到 `--imgsz` 指定的输入尺寸；应结合实际视频检查检出率与速度。
 
 处理逻辑集中在 `person_tracking/engine.py`，模型调用在 `person_tracking/detector.py`，运动预测在 `person_tracking/kalman.py`；可以直接在这里修改策略，不会影响服务中的代码。输出视频保留输入帧率和尺寸，但不包含原视频音轨。模型权重和生成的视频请勿提交到 Git。

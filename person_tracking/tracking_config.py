@@ -15,6 +15,9 @@ class PersonTrackingConfig:
     iou_threshold: float = 0.45
     image_size: int = 640
     local_image_size: int = 384
+    global_tile_size: int = 640
+    global_tile_overlap: int = 128
+    global_tile_batch_size: int = 4
     device: str | None = None
     roi_y_min: int = 0
     roi_y_max: int | None = None
@@ -52,6 +55,12 @@ class PersonTrackingConfig:
             raise ValueError("全局模型输入尺寸必须大于 0")
         if self.local_image_size <= 0:
             raise ValueError("局部模型输入尺寸必须大于 0")
+        if self.global_tile_size <= 0:
+            raise ValueError("全局分片边长必须大于 0")
+        if not 0 <= self.global_tile_overlap < self.global_tile_size:
+            raise ValueError("全局分片重叠像素必须大于等于 0 且小于分片边长")
+        if self.global_tile_batch_size <= 0:
+            raise ValueError("全局分片批量大小必须大于 0")
         if self.roi_y_min < 0:
             raise ValueError("纵向裁剪起点不能小于 0")
         if self.roi_y_max is not None and self.roi_y_max <= self.roi_y_min:

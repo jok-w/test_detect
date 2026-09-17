@@ -59,8 +59,29 @@ class YoloPersonDetector:
         返回：当前帧全部人物姿态检测结果。
         副作用：执行一次模型推理，可能使用 GPU 计算资源。
         """
+        results = self._predict(frame, image_size)
+        return self._parse_result(results[0]) if results else []
+
+    def detect_batch(
+        self,
+        frames: list[np.ndarray],
+        image_size: int | None = None,
+    ) -> list[list[PersonDetection]]:
+        """批量检测全局分片；每项结果对应输入的同序分片。"""
+        if not frames:
+            return []
+        results = self._predict(frames, image_size)
+        if len(results) != len(frames):
+            raise RuntimeError("全局分片模型结果数量与输入数量不一致")
+        return [self._parse_result(result) for result in results]
+
+    def _predict(
+        self,
+        source: np.ndarray | list[np.ndarray],
+        image_size: int | None,
+    ) -> Any:
         predict_arguments: dict[str, Any] = {
-            "source": frame,
+            "source": source,
             "conf": self.confidence,
             "iou": self.iou_threshold,
             "imgsz": image_size or self.image_size,
@@ -70,10 +91,12 @@ class YoloPersonDetector:
         }
         if self.device:
             predict_arguments["device"] = self.device
-        results = self.model.predict(**predict_arguments)
-        if not results or results[0].boxes is None:
+        return self.model.predict(**predict_arguments)
+
+    @staticmethod
+    def _parse_result(result: Any) -> list[PersonDetection]:
+        if result.boxes is None:
             return []
-        result = results[0]
         boxes = result.boxes
         if len(boxes) == 0:
             return []
