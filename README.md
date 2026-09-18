@@ -47,15 +47,32 @@ uv run --extra export python -m person_tracking.export_model pt-to-onnx \
   --model models/best.pt --output models/best.onnx
 ```
 
-然后在**目标 Jetson** 构建 engine。需要该 JetPack 配套的 TensorRT **10.x**，不通过 PyPI 自动安装或升级 TensorRT。先确认运行项目的 Python 环境可以导入它：
+然后在**目标 Jetson** 构建 engine。`pyproject.toml` 的 `tensorrt` extra 声明 `tensorrt>=10,<11`，并通过 `tool.uv.exclude-dependencies` 将它交给 JetPack/APT 管理。**`uv sync --extra tensorrt` 不会下载或安装 TensorRT，也不会校验系统包版本**；需要先安装设备配套的 TensorRT 10.x，不能仅靠 extra 完成安装。[uv 排除依赖说明](https://docs.astral.sh/uv/reference/settings/#exclude-dependencies)、[NVIDIA JetPack 6.2 安装说明](https://forums.developer.nvidia.com/t/how-to-install-tensorrt-in-jetpack-6-2/335222)。
+
+使用已配置的 JetPack APT 源安装 Python bindings 及构建所需组件：
 
 ```bash
-uv run --extra export python -c "import torch, tensorrt; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), tensorrt.__version__)"
+sudo apt install tensorrt python3-libnvinfer python3-libnvinfer-dev
+/usr/bin/python3.10 -c "import tensorrt; print(tensorrt.__version__)"
+uv sync --python 3.10 --extra export --extra tensorrt
+```
+
+如果系统 Python 可以导入，但项目虚拟环境不能导入，可将系统 bindings 所在目录添加到项目环境的 `.pth` 文件中。以下命令从实际安装位置读取路径，保留虚拟环境自身依赖的优先级：
+
+```bash
+TRT_SITE=$(/usr/bin/python3.10 -c "import pathlib, tensorrt; print(pathlib.Path(tensorrt.__file__).resolve().parent.parent)")
+uv run python -c "import pathlib, site, sys; assert sys.prefix != sys.base_prefix, '需要虚拟环境'; pathlib.Path(site.getsitepackages()[0], 'jetson-tensorrt.pth').write_text(sys.argv[1] + '\\n')" "$TRT_SITE"
+```
+
+确认项目解释器能导入且构建器可用，再执行转换：
+
+```bash
+uv run --extra export python -c "import torch, tensorrt as trt; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), trt.__version__); assert trt.__version__.startswith('10.'); assert trt.Builder(trt.Logger()) is not None"
 uv run --extra export python -m person_tracking.export_model onnx-to-engine \
   --onnx models/best.onnx --device 0 --workspace 2
 ```
 
-若系统 Python 可导入 TensorRT，而 uv/Conda 环境不能，请将 JetPack 提供的、匹配 Python 3.10 的 TensorRT Python bindings 配置到项目解释器可见路径；使用与系统兼容的虚拟环境，或按设备上实际 bindings 路径配置 `PYTHONPATH`。不要用通用桌面 CUDA wheel 替代 Jetson 运行库。`workspace` 单位为 GiB，是构建器工作区上限，并非模型运行时总内存限制；内存不足可先降为 `--workspace 1`。
+Python bindings 需要匹配 Python 3.10 和系统原生 TensorRT 库；不要用通用桌面 CUDA wheel 替代 Jetson 运行库。`workspace` 单位为 GiB，是构建器工作区上限，并非模型运行时总内存限制；内存不足可先降为 `--workspace 1`。
 
 两个 engine 分别构建并预热，通过后才替换各自目标文件；若第二个构建失败，第一个已完成的文件仍可使用。engine 内置 Ultralytics 元数据头，不能直接当作裸 TensorRT plan 交给 `trtexec`。记录并校验 TensorRT、CUDA（PyTorch 报告）、GPU 名称/计算能力及 Ultralytics 版本，环境变化时重新构建。当前工具面向 YOLO11 普通检测模型，使用 FP16 层优化、FP32 输入输出，保留现有 NMS 和跨分片去重。
 

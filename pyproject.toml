@@ -17,8 +17,15 @@ export = [
     "onnxruntime>=1.20,<1.23",
     "onnxslim>=0.1.82,<0.2",
 ]
+# Jetson TensorRT 的 Python bindings 和原生库由 JetPack/APT 提供。
+# 此 extra 声明运行依赖；uv 不从 PyPI 安装，环境接入方法见 README。
+tensorrt = [
+    "tensorrt>=10,<11; sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 
 [tool.uv]
+# 使用设备配套的 python3-libnvinfer，避免解析到桌面/SBSA 的 TensorRT 包。
+exclude-dependencies = ["tensorrt"]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
