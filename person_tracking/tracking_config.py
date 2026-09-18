@@ -9,6 +9,10 @@ class PersonTrackingConfig:
     """保存离线和实时人物识别共用的模型、区域和跟踪参数。"""
 
     model_path: Path
+    backend: str = "auto"
+    onnx_path: Path | None = None
+    global_engine_path: Path | None = None
+    local_engine_path: Path | None = None
     warmup_detections: int = 4
     prediction_frames: int = 0
     confidence: float = 0.25
@@ -43,6 +47,12 @@ class PersonTrackingConfig:
         """
         if not self.model_path.is_file():
             raise ValueError(f"模型文件不存在：{self.model_path}")
+        if self.backend not in {"auto", "pt", "onnx", "tensorrt"}:
+            raise ValueError("backend 必须是 auto、pt、onnx 或 tensorrt")
+        if self.model_path.suffix.lower() != ".pt":
+            raise ValueError("model_path 必须是用于校验和回退的 PT 权重")
+        if self.backend != "pt" and (self.image_size % 32 or self.local_image_size % 32):
+            raise ValueError("导出模型的全局和局部输入尺寸必须是 32 的倍数")
         if self.warmup_detections not in {3, 4}:
             raise ValueError("预热连续成功检测次数只能为 3 或 4")
         if self.prediction_frames < 0:

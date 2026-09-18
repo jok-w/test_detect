@@ -19,7 +19,7 @@ class DetectorDeviceTests(unittest.TestCase):
             "ultralytics": SimpleNamespace(YOLO=Mock(return_value=model)),
         }
         with patch.dict("sys.modules", modules), patch.object(Path, "is_file", return_value=True):
-            detector = YoloPersonDetector(Path("model.pt"), device=device)
+            detector = YoloPersonDetector(Path("model.pt"), device=device, backend="pt")
         return detector, cuda
 
     def test_default_gpu_reaches_single_and_batch_inference(self):

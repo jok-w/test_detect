@@ -47,6 +47,12 @@ class PersonTrackingEngine:
             iou_threshold=config.iou_threshold,
             image_size=config.image_size,
             device=config.device,
+            backend=config.backend,
+            local_image_size=config.local_image_size,
+            global_batch_size=config.global_tile_batch_size,
+            onnx_path=config.onnx_path,
+            global_engine_path=config.global_engine_path,
+            local_engine_path=config.local_engine_path,
         )
         self.reset()
 

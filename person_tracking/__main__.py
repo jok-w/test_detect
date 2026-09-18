@@ -20,6 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
         description=("逐帧使用 YOLO11n 三姿态模型和卡尔曼滤波生成人物框标注视频")
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="YOLO11n 权重路径")
+    parser.add_argument("--backend", choices=("auto", "pt", "onnx", "tensorrt"), default="auto",
+                        help="默认优先 TensorRT，缺失或初始化失败回退 PT；显式 tensorrt 失败则报错")
+    parser.add_argument("--onnx-model", type=Path, help="动态 ONNX 路径；默认与 PT 同名")
+    parser.add_argument("--global-engine", type=Path, help="默认 <PT名称>.global.engine")
+    parser.add_argument("--local-engine", type=Path, help="默认 <PT名称>.local.engine")
     parser.add_argument("--input", type=Path, required=True, help="输入视频路径")
     parser.add_argument("--output", type=Path, default=None, help="输出视频路径；默认保存到 outputs 目录")
     parser.add_argument(
@@ -115,6 +120,10 @@ def build_config(
     output_path = arguments.output or Path("outputs") / f"{input_path.stem}-tracked.mp4"
     return ProcessorConfig(
         model_path=arguments.model,
+        backend=arguments.backend,
+        onnx_path=arguments.onnx_model,
+        global_engine_path=arguments.global_engine,
+        local_engine_path=arguments.local_engine,
         input_path=input_path,
         output_path=output_path,
         warmup_detections=arguments.warmup_detections,

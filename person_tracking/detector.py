@@ -6,6 +6,10 @@ from typing import Any
 
 import numpy as np
 
+from .model_artifacts import (
+    artifact_paths, file_sha256, read_engine_metadata, read_onnx_metadata,
+    runtime_info, validate_engine, validate_source,
+)
 from .types import (
     BoundingBox,
     PersonDetection,
@@ -26,6 +30,12 @@ class YoloPersonDetector:
         iou_threshold: float = 0.45,
         image_size: int = 640,
         device: str | None = None,
+        backend: str = "auto",
+        local_image_size: int = 384,
+        global_batch_size: int = 4,
+        onnx_path: Path | None = None,
+        global_engine_path: Path | None = None,
+        local_engine_path: Path | None = None,
     ) -> None:
         """
         作用：加载 YOLO11n 模型并保存单帧推理参数。
@@ -40,15 +50,99 @@ class YoloPersonDetector:
             模型文件不存在或 Ultralytics 无法加载模型时抛出异常。
         副作用：读取并加载模型权重。
         """
+        if backend not in {"auto", "pt", "onnx", "tensorrt"}:
+            raise ValueError(f"不支持的推理后端：{backend}")
+        if model_path.suffix.lower() != ".pt":
+            raise ValueError("--model 需要 PT 权重；导出模型请使用 --onnx-model 或 --global-engine/--local-engine")
         if not model_path.is_file():
             raise FileNotFoundError(f"模型文件不存在：{model_path}")
-        from ultralytics import YOLO
-
         self.device = self._select_device(device)
-        self.model = YOLO(str(model_path))
         self.confidence = confidence
         self.iou_threshold = iou_threshold
         self.image_size = image_size
+        self.local_image_size = local_image_size
+        self.global_batch_size = global_batch_size
+        self.model = None  # PT 在 engine 无法使用时才加载，两个场景共用。
+        self._models: dict[str, Any] = {}
+        self.backend_by_scope: dict[str, str] = {}
+        self.model_paths: dict[str, str] = {}
+        default_onnx, default_global, default_local = artifact_paths(model_path)
+        paths = {"global": global_engine_path or default_global, "local": local_engine_path or default_local}
+        self._initialize_models(model_path, backend, onnx_path or default_onnx, paths)
+
+    def _initialize_models(self, model_path: Path, backend: str, onnx_path: Path, paths: dict) -> None:
+        from ultralytics import YOLO
+
+        source_hash = None
+        if backend == "onnx":
+            import onnxruntime as ort
+
+            # 第一版默认 ORT CPU；仅在实际安装 CUDA provider 时请求 GPU。
+            if self.device != "cpu" and "CUDAExecutionProvider" not in ort.get_available_providers():
+                logger.warning("ONNX Runtime 未提供 CUDAExecutionProvider，使用 ONNX CPU 推理")
+                self.device = "cpu"
+        if backend == "tensorrt" and self.device == "cpu":
+            raise ValueError("显式指定 TensorRT 时需要可用 CUDA；CPU 回退请使用 --backend auto")
+        for scope, size, batch in (("global", self.image_size, self.global_batch_size),
+                                    ("local", self.local_image_size, 1)):
+            selected = backend
+            path = paths[scope] if backend in {"auto", "tensorrt"} else onnx_path
+            model = None
+            if backend == "pt" or (backend == "auto" and self.device == "cpu"):
+                selected = "pt"
+            else:
+                try:
+                    if not path.is_file():
+                        raise FileNotFoundError(f"导出模型不存在：{path}")
+                    source_hash = source_hash or file_sha256(model_path)
+                    if backend == "onnx":
+                        metadata = read_onnx_metadata(path)
+                        tracking = validate_source(metadata, source_hash)
+                        if not tracking.get("dynamic"):
+                            raise ValueError("需要支持全局/局部尺寸的动态 ONNX")
+                        selected = "onnx"
+                    else:
+                        metadata = read_engine_metadata(path)
+                        validate_engine(metadata, source_hash, size, batch, runtime_info(self.device))
+                        selected = "tensorrt"
+                    model = YOLO(str(path), task="detect")
+                    self._warmup(model, size, batch)
+                    if selected == "onnx":
+                        # ORT 可能在 provider 初始化失败后退回 CPU，核对实际使用的 provider。
+                        self._check_onnx_provider(model)
+                except Exception as error:
+                    # 仅包围导出模型的加载与预热；正常视频推理不捕获异常。
+                    if backend != "auto":
+                        raise RuntimeError(f"{scope} 的 {backend} 初始化失败：{error}") from error
+                    logger.warning("%s TensorRT 不可用，回退 PT（device=%s）：%s", scope, self.device, error)
+                    selected = "pt"
+                    model = None
+            if selected == "pt":
+                if self.model is None:
+                    self.model = YOLO(str(model_path), task="detect")
+                model, path = self.model, model_path
+            self._models[scope] = model
+            self.backend_by_scope[scope] = selected
+            self.model_paths[scope] = str(path)
+            logger.info("%s 推理：%s，device=%s，imgsz=%s，batch=1..%s，模型=%s",
+                        scope, "TensorRT FP16" if selected == "tensorrt" else selected.upper(),
+                        self.device, size, batch, path)
+
+    def _warmup(self, model: Any, size: int, batch: int) -> None:
+        frame = np.zeros((size, size, 3), dtype=np.uint8)
+        for count in sorted({1, batch}):
+            results = model.predict(source=[frame] * count, imgsz=size, device=self.device,
+                                    rect=False, verbose=False, stream=False, agnostic_nms=True)
+            if len(results) != count:
+                raise RuntimeError("导出模型预热结果数量与输入不一致")
+
+    def _check_onnx_provider(self, model: Any) -> None:
+        # 固定的 Ultralytics 8.4.154 使用独立 ONNX 后端。
+        session = model.predictor.model.backend.session
+        providers = session.get_providers()
+        if self.device != "cpu" and "CUDAExecutionProvider" not in providers:
+            raise RuntimeError(f"ONNX CUDA provider 初始化失败，实际 providers={providers}；请使用 --device cpu 或修复 ORT")
+        logger.info("ONNX Runtime 实际 providers=%s", providers)
 
     @staticmethod
     def _select_device(device: str | None) -> str:
@@ -112,17 +206,25 @@ class YoloPersonDetector:
         source: np.ndarray | list[np.ndarray],
         image_size: int | None,
     ) -> Any:
+        scope = "global" if isinstance(source, list) else "local"
+        expected_size = self.image_size if scope == "global" else self.local_image_size
+        size = image_size or expected_size
+        count = len(source) if isinstance(source, list) else 1
+        if self.backend_by_scope[scope] == "tensorrt":
+            if size != expected_size or count > (self.global_batch_size if scope == "global" else 1):
+                raise ValueError("请求的输入尺寸或批量超出已校验的 TensorRT 范围")
         predict_arguments: dict[str, Any] = {
             "source": source,
             "conf": self.confidence,
             "iou": self.iou_threshold,
-            "imgsz": image_size or self.image_size,
+            "imgsz": size,
             "verbose": False,
             "agnostic_nms": True,
             "stream": False,
             "device": self.device,
+            "rect": False,
         }
-        return self.model.predict(**predict_arguments)
+        return self._models[scope].predict(**predict_arguments)
 
     @staticmethod
     def _parse_result(result: Any) -> list[PersonDetection]:

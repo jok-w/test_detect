@@ -2,20 +2,32 @@
 name = "person-tracking-experiment"
 version = "0.1.0"
 description = "独立的离线人物视频识别与跟踪实验"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
-    "numpy>=1.24,<3",
+    "numpy>=1.24,<2",
     "opencv-python>=4.8,<5",
-    "torch==2.14.0",
-    "torchvision==0.29.0",
-    "ultralytics>=8.3,<9",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "ultralytics==8.4.154",
+]
+
+[project.optional-dependencies]
+export = [
+    "onnx>=1.16,<1.18",
+    "onnxruntime>=1.20,<1.23",
+    "onnxslim>=0.1.82,<0.2",
+]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
-torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torch = { index = "jetson-cu126" }
+torchvision = { index = "jetson-cu126" }
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "jetson-cu126"
+url = "https://pypi.jetson-ai-lab.io/jp6/cu126"
 explicit = true
