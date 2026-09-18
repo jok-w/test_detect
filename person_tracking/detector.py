@@ -150,7 +150,7 @@ class YoloPersonDetector:
                     ),
                     confidence=float(confidence),
                     class_id=int(class_id),
-                    class_name=self._class_name(result.names, int(class_id)),
+                    class_name=YoloPersonDetector._class_name(result.names, int(class_id)),
                 )
             )
         return detections
