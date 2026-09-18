@@ -1,7 +1,6 @@
 .venv/
 __pycache__/
 *.py[cod]
-models/*.pt
 outputs/
 *.mp4
 *.avi

@@ -17,7 +17,9 @@ uv sync
 uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-运行时如需指定首张 GPU，使用 `--device 0`。
+运行时默认检查 `torch.cuda.is_available()`：CUDA 可用时显式使用首张 GPU（`device=0`），不可用时自动回退 CPU。启动日志会打印实际选择的设备；回退时打印“未检测到可用的 CUDA GPU，自动回退到 CPU 推理”。`--device cpu` 可强制使用 CPU；`--device 0` 显式请求 GPU 时，也会在 CUDA 不可用时回退 CPU。单帧和批量分片推理使用同一设备。
+
+Jetson 的 PyTorch 安装包需要与设备的 JetPack、Python 版本匹配，不能仅根据 CUDA 版本选用上面的通用安装配置。部署前请按 [NVIDIA Jetson PyTorch 兼容表](https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform-release-notes/pytorch-jetson-rel.html) 确认版本，并据此调整 `pyproject.toml` 中的 `torch`、`torchvision` 及安装源。
 
 处理任意本地视频。`models/best.pt` 已随实验目录复制，默认输出为 `outputs/输入文件名-tracked.mp4`：
 

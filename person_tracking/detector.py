@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,9 @@ from .types import (
     PersonDetection,
     bbox_iou,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class YoloPersonDetector:
@@ -30,7 +34,7 @@ class YoloPersonDetector:
             confidence：模型输出人物框的最低置信度。
             iou_threshold：YOLO 非极大值抑制使用的交并比阈值。
             image_size：模型推理输入尺寸。
-            device：Ultralytics 使用的计算设备；为空时自动选择。
+            device：为空或 auto 时优先使用 GPU；CUDA 不可用时回退 CPU。
         返回：无。
         异常：
             模型文件不存在或 Ultralytics 无法加载模型时抛出异常。
@@ -40,11 +44,39 @@ class YoloPersonDetector:
             raise FileNotFoundError(f"模型文件不存在：{model_path}")
         from ultralytics import YOLO
 
+        self.device = self._select_device(device)
         self.model = YOLO(str(model_path))
         self.confidence = confidence
         self.iou_threshold = iou_threshold
         self.image_size = image_size
-        self.device = device
+
+    @staticmethod
+    def _select_device(device: str | None) -> str:
+        """选择推理设备，并在初始化时打印设备或 CPU 回退原因。"""
+        import torch
+
+        requested = (device or "auto").strip().lower() or "auto"
+        if requested == "cpu":
+            logger.info("推理设备：CPU（手动指定）")
+            return "cpu"
+
+        automatic = requested == "auto"
+        cuda_requested = (
+            automatic
+            or requested == "cuda"
+            or requested.startswith("cuda:")
+            or all(part.strip().isdigit() for part in requested.split(","))
+        )
+        if cuda_requested:
+            if not torch.cuda.is_available():
+                logger.warning("未检测到可用的 CUDA GPU，自动回退到 CPU 推理")
+                return "cpu"
+            selected = "0" if automatic or requested == "cuda" else requested.removeprefix("cuda:")
+            logger.info("推理设备：GPU（CUDA，device=%s）", selected)
+            return selected
+
+        logger.info("推理设备：%s（手动指定）", requested)
+        return requested
 
     def detect(
         self,
@@ -88,9 +120,8 @@ class YoloPersonDetector:
             "verbose": False,
             "agnostic_nms": True,
             "stream": False,
+            "device": self.device,
         }
-        if self.device:
-            predict_arguments["device"] = self.device
         return self.model.predict(**predict_arguments)
 
     @staticmethod

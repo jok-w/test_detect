@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         default=None,
-        help="Ultralytics 设备参数，例如 cpu、0；为空时自动选择",
+        help="推理设备，例如 cpu、0；默认优先 GPU，CUDA 不可用时回退 CPU 并打印提示",
     )
     parser.add_argument("--roi-y-min", type=int, default=None)
     parser.add_argument(
