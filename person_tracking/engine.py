@@ -692,6 +692,7 @@ class PersonTrackingEngine:
         result: FrameTrackingResult,
         roi_y_max: int,
         show_regions: bool = True,
+        output_size: tuple[int, int] | None = None,
     ) -> np.ndarray:
         """
         作用：在视频帧上绘制 ROI、人物框、姿态类别和调度状态。
@@ -701,22 +702,34 @@ class PersonTrackingEngine:
             timestamp_ms：当前帧视频毫秒时间戳。
             result：当前帧最终人物跟踪结果。
             roi_y_max：固定纵向人物区域的结束像素坐标。
+            output_size：可选输出宽高，仅影响缩放绘图，结果仍使用原图坐标。
         返回：完成可视化标注的视频帧。
         """
-        annotated = frame.copy()
+        source_height, source_width = frame.shape[:2]
+        if output_size is not None and output_size != (source_width, source_height):
+            annotated = cv2.resize(frame, output_size, interpolation=cv2.INTER_AREA)
+        else:
+            annotated = frame.copy()
         frame_height, frame_width = annotated.shape[:2]
+        scale_x = frame_width / source_width
+        scale_y = frame_height / source_height
+
+        def point(x: float, y: float) -> tuple[int, int]:
+            return (min(max(int(round(x * scale_x)), 0), frame_width - 1),
+                    min(max(int(round(y * scale_y)), 0), frame_height - 1))
+
         if show_regions:
             cv2.line(
                 annotated,
-                (0, self.config.roi_y_min),
-                (frame_width - 1, self.config.roi_y_min),
+                point(0, self.config.roi_y_min),
+                (frame_width - 1, point(0, self.config.roi_y_min)[1]),
                 (255, 160, 0),
                 1,
             )
             cv2.line(
                 annotated,
-                (0, roi_y_max - 1),
-                (frame_width - 1, roi_y_max - 1),
+                point(0, roi_y_max - 1),
+                (frame_width - 1, point(0, roi_y_max - 1)[1]),
                 (255, 160, 0),
                 1,
             )
@@ -724,14 +737,15 @@ class PersonTrackingEngine:
                 crop = result.crop_window
                 cv2.rectangle(
                     annotated,
-                    (crop.x1, crop.y1),
-                    (crop.x2 - 1, crop.y2 - 1),
+                    point(crop.x1, crop.y1),
+                    point(crop.x2 - 1, crop.y2 - 1),
                     (255, 0, 255),
                     1,
                 )
         if result.bbox is not None:
-            bbox = result.bbox.clamped(frame_width, frame_height)
-            x1, y1, x2, y2 = bbox.as_int_xyxy()
+            bbox = result.bbox
+            x1, y1 = point(bbox.x1, bbox.y1)
+            x2, y2 = point(bbox.x2, bbox.y2)
             color = (0, 200, 0) if result.source == "model" else (0, 180, 255)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             confidence_text = (
@@ -743,7 +757,9 @@ class PersonTrackingEngine:
                 f"{result.source}: {result.class_name or 'person'}"
                 f"{confidence_text}"
             )
-            self._draw_text(annotated, label, (x1, max(y1 - 8, 20)), color)
+            label_width = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 3)[0][0]
+            label_x = min(x1, max(frame_width - label_width - 4, 0))
+            self._draw_text(annotated, label, (label_x, max(y1 - 8, 20)), color)
         status_text = (
             f"frame={frame_index} time={timestamp_ms:.1f}ms "
             f"state={result.state} source={result.source} "

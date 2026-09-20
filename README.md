@@ -11,7 +11,7 @@ cd /home/mtr/Desktop/test_detect
 uv sync --python 3.10
 ```
 
-`pyproject.toml` 按当前 Jetson 部署配置限定 Linux aarch64、Python 3.10 和 NumPy 1.x，固定 `torch 2.8.0`、`torchvision 0.23.0`，并使用 Jetson AI Lab 的 `jp6/cu126` 索引。部署后可检查安装结果：
+`pyproject.toml` 支持 Jetson（Linux aarch64）和 Windows x64（AMD64），共用 Python 3.10、NumPy 1.x、`torch 2.8.0`、`torchvision 0.23.0`。uv 按平台选择安装源：Jetson 使用 Jetson AI Lab 的 `jp6/cu126`，Windows 使用 PyTorch 官方 `cu126`，无需手动修改依赖。Windows 的版本组合见 [PyTorch 官方安装说明](https://pytorch.org/get-started/previous-versions/#v280)。部署后可检查安装结果：
 
 ```bash
 uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
@@ -19,7 +19,35 @@ uv run python -c "import torch; print(torch.__version__, torch.version.cuda, tor
 
 运行时默认检查 `torch.cuda.is_available()`：CUDA 可用时显式使用首张 GPU（`device=0`），不可用时自动回退 CPU。启动日志会打印实际选择的设备；回退时打印“未检测到可用的 CUDA GPU，自动回退到 CPU 推理”。`--device cpu` 可强制使用 CPU；`--device 0` 显式请求 GPU 时，也会在 CUDA 不可用时回退 CPU。全局整帧和局部裁剪推理使用同一设备，每次仅输入一张图。
 
-此依赖配置用于 JetPack 6 / CUDA 12.6 部署环境。其他 JetPack 版本需要重新匹配依赖；当前配置不包含 Windows 安装环境。
+Jetson 配置用于 JetPack 6 / CUDA 12.6，其他 JetPack 版本需要重新匹配依赖。
+
+### Windows 安装与运行
+
+在 PowerShell 中执行（将项目和视频路径替换为实际位置）：
+
+```powershell
+cd E:\detect_test
+uv sync --python 3.10
+uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+uv run python -m person_tracking `
+  --model models/best.pt `
+  --input "D:\videos\test.mp4" `
+  --backend pt `
+  --no-display
+```
+
+默认安装 CUDA 12.6 版 PyTorch，有兼容的 NVIDIA GPU 和驱动时使用 GPU，无可用 CUDA 时回退 CPU；也可添加 `--device cpu` 强制 CPU。CUDA 版安装包较大，CPU 回退无需更换安装源。需要显示窗口时去掉 `--no-display`。
+
+Windows 可安装 ONNX 导出依赖，使用同一导出及推理工具：
+
+```powershell
+uv sync --python 3.10 --extra export
+uv run --extra export python -m person_tracking.export_model pt-to-onnx
+uv run --extra export python -m person_tracking `
+  --input "D:\videos\test.mp4" --backend onnx --device cpu --no-display
+```
+
+本配置在 Windows 支持 PT/ONNX，`tensorrt` extra 仅声明 Jetson 系统依赖，不会在 Windows 安装 TensorRT。Jetson 生成的 engine 不用于 Windows；TensorRT 构建及以下 APT 安装步骤在目标 Jetson 执行。
 
 ## PT → ONNX → TensorRT FP16
 
@@ -142,10 +170,21 @@ uv run python -m person_tracking \
 
 ## 调整策略
 
+输出视频默认最大宽度为 1920：4K 横屏输入保存为 1920×1080，小视频不放大；按比例缩放后，宽高向下对齐偶数（最小为 2）以适配编码器。检测与卡尔曼跟踪始终使用原始画面，人物框、裁剪框和 ROI 仅在输出绘图时映射到新尺寸，文字在缩小后的画面上绘制。帧率、帧数保持不变。
+
+可用 `--output-max-width 1280` 进一步减少输出编码量，或用 `--output-max-width 0` 保留原尺寸（奇数边长仍对齐偶数）。例如：
+
+```bash
+uv run python -m person_tracking --input camera_20260910_143934.mp4 --output-max-width 1920 --no-display
+```
+
+启动日志显示输入和输出尺寸；完成日志分别报告读取、检测跟踪、缩放绘图、显示、编码写入的平均耗时。分项及等效处理速度不含模型初始化、编码器收尾；编码写入统计同步 `writer.write` 的耗时。仅减小输出尺寸不会减少原视频的解码开销。
+
 所有处理参数可用 `uv run python -m person_tracking --help` 查看。常用参数：
 
 | 参数 | 用途 | 默认值 |
 |---|---|---:|
+| `--output-max-width` | 保存和显示画面的最大宽度；0 保留原尺寸，编码尺寸对齐偶数 | 1920 |
 | `--prediction-frames` | 两次局部模型检测之间只使用卡尔曼预测的帧数；设为 `0` 可每帧检测 | 5 |
 | `--warmup-detections` | 初始阶段连续检测成功次数 | 4 |
 | `--confidence` | 模型置信度阈值 | 0.25 |
@@ -159,4 +198,4 @@ uv run python -m person_tracking \
 
 全局搜索（首次捕获、预热和丢失后重捕获）每次直接传入完整原始帧，模型预处理按 `--imgsz` 缩放补边，后处理返回原图坐标的检测框，不再裁分片或叠加分片偏移。指定纵向 ROI 时，仍传入整帧，仅保留检测框中心满足 `roi_y_min <= center_y < roi_y_max` 的候选人物。局部跟踪继续使用卡尔曼预测的动态裁剪及坐标映射。
 
-处理逻辑集中在 `person_tracking/engine.py`，模型调用在 `person_tracking/detector.py`，运动预测在 `person_tracking/kalman.py`；可以直接在这里修改策略，不会影响服务中的代码。输出视频保留输入帧率和尺寸，但不包含原视频音轨。模型权重和生成的视频请勿提交到 Git。
+处理逻辑集中在 `person_tracking/engine.py`，模型调用在 `person_tracking/detector.py`，运动预测在 `person_tracking/kalman.py`；可以直接在这里修改策略，不会影响服务中的代码。输出视频保留输入帧率，尺寸由 `--output-max-width` 决定，不包含原视频音轨。模型权重和生成的视频请勿提交到 Git。

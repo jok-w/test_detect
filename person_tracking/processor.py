@@ -21,6 +21,7 @@ class ProcessorConfig(PersonTrackingConfig):
     input_path: Path
     output_path: Path
     codec: str = "mp4v"
+    output_max_width: int = 1920
     display: bool = True
     display_window_name: str = "人物检测与卡尔曼跟踪"
 
@@ -37,6 +38,8 @@ class ProcessorConfig(PersonTrackingConfig):
             raise ValueError("输出视频不能覆盖输入视频")
         if len(self.codec) != 4:
             raise ValueError("输出视频编码必须是四字符编码")
+        if self.output_max_width < 0 or self.output_max_width == 1:
+            raise ValueError("输出最大宽度必须为 0 或至少 2 像素")
         if self.display and not self.display_window_name.strip():
             raise ValueError("启用即时显示时窗口名称不能为空")
 
@@ -54,6 +57,11 @@ class ProcessingStats:
     frames_without_box: int
     average_frame_time_ms: float
     average_processing_fps: float
+    average_read_time_ms: float
+    average_tracking_time_ms: float
+    average_drawing_time_ms: float
+    average_display_time_ms: float
+    average_encoding_time_ms: float
     stopped_by_user: bool
     output_path: Path
 
@@ -87,10 +95,13 @@ class PersonVideoProcessor(PersonTrackingEngine):
         try:
             fps, frame_width, frame_height = self._read_video_metadata(capture)
             roi_y_max = self._resolve_roi_y_max(frame_height)
+            output_size = self._resolve_output_size(frame_width, frame_height)
+            logger.info("视频输入=%sx%s，输出=%sx%s，fps=%.3f，编码=%s",
+                        frame_width, frame_height, *output_size, fps, self.config.codec)
             self.config.output_path.parent.mkdir(parents=True, exist_ok=True)
-            writer = self._create_writer(fps, frame_width, frame_height)
+            writer = self._create_writer(fps, *output_size)
             if self.config.display:
-                self._open_display_window(frame_width, frame_height)
+                self._open_display_window(*output_size)
                 display_window_opened = True
             total_frames = 0
             written_frames = 0
@@ -100,6 +111,8 @@ class PersonVideoProcessor(PersonTrackingEngine):
             kalman_only_frames = 0
             frames_without_box = 0
             total_processing_seconds = 0.0
+            read_seconds = tracking_seconds = drawing_seconds = 0.0
+            display_seconds = encoding_seconds = 0.0
             stopped_by_user = False
             last_timestamp_ms = -1.0
             while True:
@@ -114,6 +127,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
                     last_timestamp_ms=last_timestamp_ms,
                 )
                 last_timestamp_ms = timestamp_ms
+                read_finished_at = time.perf_counter()
                 tracking_result, used_model = self.process_frame(frame, timestamp_ms)
                 if used_model:
                     model_frames += 1
@@ -125,21 +139,31 @@ class PersonVideoProcessor(PersonTrackingEngine):
                     kalman_only_frames += 1
                 if tracking_result.bbox is None:
                     frames_without_box += 1
+                tracking_finished_at = time.perf_counter()
                 annotated_frame = self._draw_result(
                     frame=frame,
                     frame_index=total_frames,
                     timestamp_ms=timestamp_ms,
                     result=tracking_result,
                     roi_y_max=roi_y_max,
+                    output_size=output_size,
                 )
+                drawing_finished_at = time.perf_counter()
                 should_continue = self._display_frame(annotated_frame)
+                display_finished_at = time.perf_counter()
                 self._write_frame_synchronously(
                     writer=writer,
                     frame=annotated_frame,
                     frame_index=total_frames,
                 )
+                encoding_finished_at = time.perf_counter()
                 written_frames += 1
-                total_processing_seconds += time.perf_counter() - frame_started_at
+                read_seconds += read_finished_at - frame_started_at
+                tracking_seconds += tracking_finished_at - read_finished_at
+                drawing_seconds += drawing_finished_at - tracking_finished_at
+                display_seconds += display_finished_at - drawing_finished_at
+                encoding_seconds += encoding_finished_at - display_finished_at
+                total_processing_seconds += encoding_finished_at - frame_started_at
                 total_frames += 1
                 if total_frames % max(int(round(fps)), 1) == 0:
                     logger.info("已处理人物视频 %s 帧", total_frames)
@@ -172,6 +196,11 @@ class PersonVideoProcessor(PersonTrackingEngine):
                 frames_without_box=frames_without_box,
                 average_frame_time_ms=average_frame_time_ms,
                 average_processing_fps=average_processing_fps,
+                average_read_time_ms=read_seconds * 1000.0 / total_frames,
+                average_tracking_time_ms=tracking_seconds * 1000.0 / total_frames,
+                average_drawing_time_ms=drawing_seconds * 1000.0 / total_frames,
+                average_display_time_ms=display_seconds * 1000.0 / total_frames,
+                average_encoding_time_ms=encoding_seconds * 1000.0 / total_frames,
                 stopped_by_user=stopped_by_user,
                 output_path=self.config.output_path,
             )
@@ -182,6 +211,16 @@ class PersonVideoProcessor(PersonTrackingEngine):
             if display_window_opened:
                 self._close_display_window()
 
+
+    def _resolve_output_size(self, frame_width: int, frame_height: int) -> tuple[int, int]:
+        """计算不放大的输出尺寸；按宽度等比例缩小，两边向下对齐偶数以供编码。"""
+        if frame_width < 2 or frame_height < 2:
+            raise ValueError("输出视频宽高必须至少为 2 像素")
+        limit = self.config.output_max_width
+        width = min(frame_width, limit) if limit else frame_width
+        width -= width % 2
+        height = max(2, int(frame_height * width / frame_width) // 2 * 2)
+        return width, height
 
     def _open_display_window(self, frame_width: int, frame_height: int) -> None:
         """
@@ -304,7 +343,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
         frame_height: int,
     ) -> cv2.VideoWriter:
         """
-        作用：创建与输入视频帧率和画面尺寸一致的输出编码器。
+        作用：按输入帧率和指定输出画面尺寸创建编码器。
         参数：
             fps：输入视频帧率。
             frame_width：输出视频宽度，单位为像素。
