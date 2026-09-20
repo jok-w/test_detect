@@ -9,6 +9,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+ENGINE_STRATEGY = "single-image-fp16-v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -65,11 +66,13 @@ def validate_source(metadata: dict, source_hash: str) -> dict:
     return tracking
 
 
-def validate_engine(metadata: dict, source_hash: str, image_size: int, batch_size: int, runtime: dict) -> dict:
+def validate_engine(metadata: dict, source_hash: str, image_size: int, runtime: dict) -> dict:
     tracking = validate_source(metadata, source_hash)
-    max_batch = tracking.get("max_batch")
-    if tracking.get("image_size") != image_size or not isinstance(max_batch, int) or not 1 <= batch_size <= max_batch:
-        raise ValueError(f"engine 输入范围不支持 imgsz={image_size}、batch={batch_size}，请重新构建")
+    if (tracking.get("strategy") != ENGINE_STRATEGY or tracking.get("max_batch") != 1
+            or tracking.get("dynamic") is not False):
+        raise ValueError("engine 不是当前固定 batch=1 的单图策略（可能为旧分片模型），请重新构建")
+    if tracking.get("image_size") != image_size:
+        raise ValueError(f"静态 engine 不支持 imgsz={image_size}，请重新构建")
     if tracking.get("precision") != "fp16":
         raise ValueError("当前只支持项目导出的 FP16 engine")
     environment = tracking.get("runtime")

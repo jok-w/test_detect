@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil
 
 import cv2
 import numpy as np
@@ -9,7 +8,7 @@ import numpy as np
 from .detector import YoloPersonDetector
 from .kalman import BoundingBoxKalmanFilter
 from .tracking_config import PersonTrackingConfig
-from .types import BoundingBox, CropWindow, PersonDetection, bbox_iou
+from .types import BoundingBox, CropWindow, PersonDetection
 
 
 @dataclass(frozen=True)
@@ -49,7 +48,6 @@ class PersonTrackingEngine:
             device=config.device,
             backend=config.backend,
             local_image_size=config.local_image_size,
-            global_batch_size=config.global_tile_batch_size,
             onnx_path=config.onnx_path,
             global_engine_path=config.global_engine_path,
             local_engine_path=config.local_engine_path,
@@ -179,7 +177,7 @@ class PersonTrackingEngine:
         roi_y_max: int,
     ) -> tuple[FrameTrackingResult, bool]:
         """
-        作用：在固定纵向区域连续检测人物并建立可靠的卡尔曼运动状态。
+        作用：整帧连续检测并筛选 ROI 内人物，建立可靠的卡尔曼运动状态。
         参数：
             frame：当前原始视频帧。
             predicted_bbox：当前帧卡尔曼预测框。
@@ -348,80 +346,23 @@ class PersonTrackingEngine:
         roi_y_max: int,
     ) -> PersonDetection | None:
         """
-        作用：将固定纵向 ROI 分片检测，映射并去重后选择唯一受训人员。
+        作用：整帧执行一次全局检测，再按纵向 ROI 筛选并选择唯一受训人员。
         参数：
             frame：当前原始视频帧。
             predicted_bbox：可靠时用于筛选候选框的卡尔曼预测框。
             roi_y_max：固定纵向人物区域的结束像素坐标。
         返回：恢复到原始画面坐标的唯一人物检测；未检测到时返回 None。
-        副作用：按批次执行 YOLO11n 全局分片推理。
+        副作用：执行一次 batch=1 的全局推理；检测框已是原图坐标。
         """
-        tile_size = self.config.global_tile_size
-        overlap = self.config.global_tile_overlap
-        frame_width = frame.shape[1]
-        roi_height = roi_y_max - self.config.roi_y_min
-        tile_width = min(tile_size, frame_width)
-        tile_height = min(tile_size, roi_height)
-        x_starts = self._tile_starts(frame_width, tile_width, overlap)
-        y_starts = self._tile_starts(roi_height, tile_height, overlap)
-        windows = [
-            CropWindow(
-                x1=x,
-                y1=self.config.roi_y_min + y,
-                x2=x + tile_width,
-                y2=self.config.roi_y_min + y + tile_height,
-            )
-            for y in y_starts
-            for x in x_starts
+        detections = self.detector.detect(frame, image_size=self.config.image_size, scope="global")
+        detections = [
+            detection for detection in detections
+            if self.config.roi_y_min <= detection.bbox.center[1] < roi_y_max
         ]
-        detections: list[PersonDetection] = []
-        batch_size = self.config.global_tile_batch_size
-        for offset in range(0, len(windows), batch_size):
-            batch_windows = windows[offset : offset + batch_size]
-            batch_frames = [
-                frame[window.y1 : window.y2, window.x1 : window.x2]
-                for window in batch_windows
-            ]
-            batch_detections = self.detector.detect_batch(
-                batch_frames,
-                image_size=self.config.image_size,
-            )
-            for window, tile_detections in zip(batch_windows, batch_detections):
-                detections.extend(
-                    PersonDetection(
-                        bbox=detection.bbox.shifted(window.x1, window.y1),
-                        confidence=detection.confidence,
-                        class_id=detection.class_id,
-                        class_name=detection.class_name,
-                    )
-                    for detection in tile_detections
-                )
         return self.detector.select_single_person(
-            detections=self._deduplicate_detections(
-                detections, self.config.iou_threshold,
-            ),
+            detections=detections,
             predicted_bbox=predicted_bbox,
         )
-
-    @staticmethod
-    def _tile_starts(length: int, tile_size: int, overlap: int) -> list[int]:
-        """平均分布分片，保证覆盖边缘且相邻分片至少重叠指定像素。"""
-        if length <= tile_size:
-            return [0]
-        count = ceil((length - tile_size) / (tile_size - overlap)) + 1
-        return [round(index * (length - tile_size) / (count - 1)) for index in range(count)]
-
-    @staticmethod
-    def _deduplicate_detections(
-        detections: list[PersonDetection],
-        iou_threshold: float,
-    ) -> list[PersonDetection]:
-        """跨分片执行不区分类别的置信度优先 NMS。"""
-        selected: list[PersonDetection] = []
-        for detection in sorted(detections, key=lambda item: item.confidence, reverse=True):
-            if all(bbox_iou(detection.bbox, kept.bbox) <= iou_threshold for kept in selected):
-                selected.append(detection)
-        return selected
 
 
     def _detect_local_person(
@@ -450,6 +391,7 @@ class PersonTrackingEngine:
         crop_detections = self.detector.detect(
             crop_frame,
             image_size=self.config.local_image_size,
+            scope="local",
         )
         detections = [
             PersonDetection(

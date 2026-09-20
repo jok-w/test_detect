@@ -17,7 +17,7 @@ uv sync --python 3.10
 uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-运行时默认检查 `torch.cuda.is_available()`：CUDA 可用时显式使用首张 GPU（`device=0`），不可用时自动回退 CPU。启动日志会打印实际选择的设备；回退时打印“未检测到可用的 CUDA GPU，自动回退到 CPU 推理”。`--device cpu` 可强制使用 CPU；`--device 0` 显式请求 GPU 时，也会在 CUDA 不可用时回退 CPU。单帧和批量分片推理使用同一设备。
+运行时默认检查 `torch.cuda.is_available()`：CUDA 可用时显式使用首张 GPU（`device=0`），不可用时自动回退 CPU。启动日志会打印实际选择的设备；回退时打印“未检测到可用的 CUDA GPU，自动回退到 CPU 推理”。`--device cpu` 可强制使用 CPU；`--device 0` 显式请求 GPU 时，也会在 CUDA 不可用时回退 CPU。全局整帧和局部裁剪推理使用同一设备，每次仅输入一张图。
 
 此依赖配置用于 JetPack 6 / CUDA 12.6 部署环境。其他 JetPack 版本需要重新匹配依赖；当前配置不包含 Windows 安装环境。
 
@@ -30,9 +30,13 @@ uv run python -c "import torch; print(torch.__version__, torch.version.cuda, tor
 | 文件 | 用途 | 默认输入 |
 |---|---|---|
 | `models/best.pt` | 原始权重及 GPU/CPU 回退 | 按推理参数 |
-| `models/best.onnx` | 动态 FP32 中间模型、ONNX 验证 | 动态 batch 和空间尺寸 |
-| `models/best.global.engine` | 全局分片 FP16 | 640×640，batch 1～4，优化 batch=4 |
-| `models/best.local.engine` | 局部跟踪 FP16 | 384×384，batch=1 |
+| `models/best.onnx` | 动态 FP32 中间模型、ONNX 验证 | 保留动态维度供两个尺寸共用，运行时 batch=1 |
+| `models/best.global.engine` | 全局整帧 FP16 | 固定 1×3×640×640 |
+| `models/best.local.engine` | 局部跟踪 FP16 | 固定 1×3×384×384 |
+
+全局检测已取消分片，每个全局检测帧只调用一次模型。TensorRT 针对固定 batch=1、固定空间尺寸构建，不再配置 batch 1～4 的动态优化范围；两个 engine 分别优化全局和局部输入，继续采用 FP16 层优化。整图仍会等比例缩放并补边到 `--imgsz`，不是按原始 4K 分辨率直接计算。若缩小后人物过小，可用 `--imgsz 960` 或 `1280` 比较检出率与延迟，并按同一尺寸重建全局 engine。
+
+升级后需要重新构建两个 engine。旧动态 ONNX 仍可作为构建输入；旧 engine 缺少单图策略标记或输入为动态 batch 时，自动模式会打印原因并回退 PT，强制 TensorRT 模式会报错要求重建。原来的 `--global-tile-size`、`--global-tile-overlap`、`--global-tile-batch-size` 及导出工具的 `--batch` 参数已移除。
 
 安装导出依赖（保留 Jetson torch/torchvision 配置，Ultralytics 固定为本项目验证的 8.4.154）：
 
@@ -74,7 +78,7 @@ uv run --extra export python -m person_tracking.export_model onnx-to-engine \
 
 Python bindings 需要匹配 Python 3.10 和系统原生 TensorRT 库；不要用通用桌面 CUDA wheel 替代 Jetson 运行库。`workspace` 单位为 GiB，是构建器工作区上限，并非模型运行时总内存限制；内存不足可先降为 `--workspace 1`。
 
-两个 engine 分别构建并预热，通过后才替换各自目标文件；若第二个构建失败，第一个已完成的文件仍可使用。engine 内置 Ultralytics 元数据头，不能直接当作裸 TensorRT plan 交给 `trtexec`。记录并校验 TensorRT、CUDA（PyTorch 报告）、GPU 名称/计算能力及 Ultralytics 版本，环境变化时重新构建。当前工具面向 YOLO11 普通检测模型，使用 FP16 层优化、FP32 输入输出，保留现有 NMS 和跨分片去重。
+两个 engine 分别构建并预热，通过后才替换各自目标文件；若第二个构建失败，第一个已完成的文件仍可使用。engine 内置 Ultralytics 元数据头，不能直接当作裸 TensorRT plan 交给 `trtexec`。记录并校验 TensorRT、CUDA（PyTorch 报告）、GPU 名称/计算能力及 Ultralytics 版本，环境变化时重新构建。当前工具面向 YOLO11 普通检测模型，使用 FP16 层优化、FP32 输入输出，保留模型后处理的类别无关 NMS，已移除跨分片去重。
 
 构建后运行：
 
@@ -88,16 +92,16 @@ uv run --extra export python -m person_tracking --input /path/to/video.mp4 --bac
 
 可使用 `--onnx-model`、`--global-engine`、`--local-engine` 指定导出文件。ONNX 使用两个独立预测器，默认 export 依赖安装的是 CPU ONNX Runtime；只有已安装的 ORT 提供 CUDA provider 时才尝试 ONNX GPU，并打印实际 providers。TensorRT 不依赖 ONNX Runtime GPU 包。
 
-需要改变尺寸或批量时，重新构建并使用相同推理参数，例如：
+需要改变网络输入尺寸时，重新构建并使用相同推理参数，例如：
 
 ```bash
 uv run --extra export python -m person_tracking.export_model onnx-to-engine \
-  --onnx models/best.onnx --global-imgsz 640 --local-imgsz 384 --batch 2
+  --onnx models/best.onnx --global-imgsz 960 --local-imgsz 384
 uv run python -m person_tracking --input /path/to/video.mp4 --backend tensorrt \
-  --imgsz 640 --local-imgsz 384 --global-tile-batch-size 2 --no-display
+  --imgsz 960 --local-imgsz 384 --no-display
 ```
 
-全局末批不足最大 batch 时直接按实际数量运行。预处理统一 `rect=False`，将原图裁剪缩放、补边至对应正方形输入；原始裁剪尺寸变化无需重建 engine。尺寸必须为 32 的倍数。
+预处理统一 `rect=False`，将全局原始整帧或局部裁剪等比例缩放、补边至对应正方形输入。原始视频分辨率或裁剪大小变化无需重建 engine；改变网络输入尺寸才需要重建，尺寸必须为 32 的倍数。全局和局部通过显式场景参数选择模型，即使两个网络输入尺寸相同也不会混用。
 
 ## 性能与结果对照
 
@@ -111,7 +115,7 @@ uv run python -m person_tracking.benchmark --input /path/to/video.mp4 \
 
 也可以用 `--candidate onnx --device cpu` 配合 `uv run --extra export` 验证 ONNX。报告写明实际后端和设备；TensorRT 对照强制使用 engine，失败会报错。测试不显示、绘制或编码视频，报告的 FPS 包含视频读取和检测/跟踪，不是完整输出视频的端到端 FPS；结果框比较包含跟踪产生的框，不代表标注集上的 mAP。没有进入局部跟踪的测试，其局部统计为 null，应改用包含人物、遮挡和重捕获的代表性视频。
 
-完整读写流程的速度请另外使用普通 `person_tracking --backend pt/tensorrt --no-display` 处理同一视频，比较已有完成日志。保持设备功耗模式、温度、阈值、输入尺寸和批量一致；本地 CPU 验证不能代表 Jetson TensorRT 提速。
+完整读写流程的速度请另外使用普通 `person_tracking --backend pt/tensorrt --no-display` 处理同一视频，比较已有完成日志。保持设备功耗模式、温度、阈值和输入尺寸一致；两种后端均采用 batch=1。本地 CPU 验证不能代表 Jetson TensorRT 提速。
 
 处理任意本地视频。`models/best.pt` 已随实验目录复制，默认输出为 `outputs/输入文件名-tracked.mp4`：
 
@@ -145,17 +149,14 @@ uv run python -m person_tracking \
 | `--prediction-frames` | 两次局部模型检测之间只使用卡尔曼预测的帧数；设为 `0` 可每帧检测 | 5 |
 | `--warmup-detections` | 初始阶段连续检测成功次数 | 4 |
 | `--confidence` | 模型置信度阈值 | 0.25 |
-| `--imgsz` | 全局检测输入尺寸 | 640 |
-| `--global-tile-size` | 全局搜索分片在原图中的边长，单位为像素 | 640 |
-| `--global-tile-overlap` | 相邻全局分片的最小重叠，单位为像素 | 128 |
-| `--global-tile-batch-size` | 每批送入模型的全局分片数量 | 4 |
+| `--imgsz` | 全局整帧缩放补边后的正方形网络输入尺寸 | 640 |
 | `--local-imgsz` | 动态裁剪后检测输入尺寸 | 384 |
-| `--roi-y-min` / `--roi-y-max` | 人物搜索区域的上下边界，单位为像素；默认整个画面 | 0 / 视频底部 |
+| `--roi-y-min` / `--roi-y-max` | 全局检测后按框中心筛选的纵向范围，也是局部裁剪的边界 | 0 / 视频底部 |
 | `--crop-min-size` / `--crop-max-size` | 动态裁剪尺寸范围，单位为像素 | 320 / 800 |
 | `--recovery-misses` | 局部检测连续漏检后切回全局搜索的次数 | 3 |
 | `--global-recovery-ms` | 无成功测量后切回全局搜索的时间，单位为毫秒 | 300 |
 | `--max-prediction-ms` | 最长绘制纯预测框的时间，单位为毫秒 | 500 |
 
-全局搜索（首次捕获、预热和丢失后重捕获）现在会对固定纵向 ROI 分片推理。默认 640×640 原图像素分片、至少重叠 128 像素；3840×2160 且搜索区域为整帧时共 8 列×4 行，即 32 个分片，分 8 批运行。检测框会映射回原始画面坐标，并进行跨分片去重。局部跟踪仍使用卡尔曼预测的动态裁剪。若画面中的人高于约 640 像素，可增大 `--global-tile-size`，模型仍会把该分片缩放到 `--imgsz` 指定的输入尺寸；应结合实际视频检查检出率与速度。
+全局搜索（首次捕获、预热和丢失后重捕获）每次直接传入完整原始帧，模型预处理按 `--imgsz` 缩放补边，后处理返回原图坐标的检测框，不再裁分片或叠加分片偏移。指定纵向 ROI 时，仍传入整帧，仅保留检测框中心满足 `roi_y_min <= center_y < roi_y_max` 的候选人物。局部跟踪继续使用卡尔曼预测的动态裁剪及坐标映射。
 
 处理逻辑集中在 `person_tracking/engine.py`，模型调用在 `person_tracking/detector.py`，运动预测在 `person_tracking/kalman.py`；可以直接在这里修改策略，不会影响服务中的代码。输出视频保留输入帧率和尺寸，但不包含原视频音轨。模型权重和生成的视频请勿提交到 Git。

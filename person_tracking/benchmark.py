@@ -40,8 +40,8 @@ def run_video(config, limit: int, warmup: int) -> dict:
     try:
         if warmup:
             # PT 可能在预热视频里一直未找到人物，也应预热局部输入尺寸。
-            detector._warmup(detector._models["global"], config.image_size, config.global_tile_batch_size)
-            detector._warmup(detector._models["local"], config.local_image_size, 1)
+            detector._warmup(detector._models["global"], config.image_size)
+            detector._warmup(detector._models["local"], config.local_image_size)
         for warming, count in ((True, warmup), (False, limit)):
             if not count:
                 continue

@@ -22,13 +22,13 @@ class DetectorDeviceTests(unittest.TestCase):
             detector = YoloPersonDetector(Path("model.pt"), device=device, backend="pt")
         return detector, cuda
 
-    def test_default_gpu_reaches_single_and_batch_inference(self):
+    def test_default_gpu_reaches_global_and_local_inference(self):
         with self.assertLogs("person_tracking.detector", level="INFO") as logs:
             detector, _ = self.make_detector(True)
         frame = np.zeros((32, 32, 3), dtype=np.uint8)
         detector.detect(frame)
-        detector.model.predict.return_value = [SimpleNamespace(boxes=None)] * 2
-        detector.detect_batch([frame, frame])
+        detector.model.predict.return_value = [SimpleNamespace(boxes=None)]
+        detector.detect(frame, scope="global")
         self.assertEqual([call.kwargs["device"] for call in detector.model.predict.call_args_list], ["0", "0"])
         self.assertIn("GPU", logs.output[0])
 

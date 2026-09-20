@@ -32,7 +32,6 @@ class YoloPersonDetector:
         device: str | None = None,
         backend: str = "auto",
         local_image_size: int = 384,
-        global_batch_size: int = 4,
         onnx_path: Path | None = None,
         global_engine_path: Path | None = None,
         local_engine_path: Path | None = None,
@@ -61,7 +60,6 @@ class YoloPersonDetector:
         self.iou_threshold = iou_threshold
         self.image_size = image_size
         self.local_image_size = local_image_size
-        self.global_batch_size = global_batch_size
         self.model = None  # PT 在 engine 无法使用时才加载，两个场景共用。
         self._models: dict[str, Any] = {}
         self.backend_by_scope: dict[str, str] = {}
@@ -83,8 +81,7 @@ class YoloPersonDetector:
                 self.device = "cpu"
         if backend == "tensorrt" and self.device == "cpu":
             raise ValueError("显式指定 TensorRT 时需要可用 CUDA；CPU 回退请使用 --backend auto")
-        for scope, size, batch in (("global", self.image_size, self.global_batch_size),
-                                    ("local", self.local_image_size, 1)):
+        for scope, size in (("global", self.image_size), ("local", self.local_image_size)):
             selected = backend
             path = paths[scope] if backend in {"auto", "tensorrt"} else onnx_path
             model = None
@@ -103,10 +100,10 @@ class YoloPersonDetector:
                         selected = "onnx"
                     else:
                         metadata = read_engine_metadata(path)
-                        validate_engine(metadata, source_hash, size, batch, runtime_info(self.device))
+                        validate_engine(metadata, source_hash, size, runtime_info(self.device))
                         selected = "tensorrt"
                     model = YOLO(str(path), task="detect")
-                    self._warmup(model, size, batch)
+                    self._warmup(model, size)
                     if selected == "onnx":
                         # ORT 可能在 provider 初始化失败后退回 CPU，核对实际使用的 provider。
                         self._check_onnx_provider(model)
@@ -124,17 +121,16 @@ class YoloPersonDetector:
             self._models[scope] = model
             self.backend_by_scope[scope] = selected
             self.model_paths[scope] = str(path)
-            logger.info("%s 推理：%s，device=%s，imgsz=%s，batch=1..%s，模型=%s",
+            logger.info("%s 推理：%s，device=%s，imgsz=%s，batch=1，模型=%s",
                         scope, "TensorRT FP16" if selected == "tensorrt" else selected.upper(),
-                        self.device, size, batch, path)
+                        self.device, size, path)
 
-    def _warmup(self, model: Any, size: int, batch: int) -> None:
+    def _warmup(self, model: Any, size: int) -> None:
         frame = np.zeros((size, size, 3), dtype=np.uint8)
-        for count in sorted({1, batch}):
-            results = model.predict(source=[frame] * count, imgsz=size, device=self.device,
-                                    rect=False, verbose=False, stream=False, agnostic_nms=True)
-            if len(results) != count:
-                raise RuntimeError("导出模型预热结果数量与输入不一致")
+        results = model.predict(source=frame, imgsz=size, device=self.device,
+                                rect=False, verbose=False, stream=False, agnostic_nms=True)
+        if len(results) != 1:
+            raise RuntimeError("导出模型预热必须返回一张图的结果")
 
     def _check_onnx_provider(self, model: Any) -> None:
         # 固定的 Ultralytics 8.4.154 使用独立 ONNX 后端。
@@ -176,43 +172,36 @@ class YoloPersonDetector:
         self,
         frame: np.ndarray,
         image_size: int | None = None,
+        *,
+        scope: str = "local",
     ) -> list[PersonDetection]:
         """
-        作用：对单帧、固定纵向区域或动态裁剪区域执行三姿态人物检测。
+        作用：对整帧或局部裁剪执行一次 batch=1 的三姿态人物检测。
         参数：
             frame：OpenCV BGR 格式的单帧图像。
-            image_size：本次推理使用的输入尺寸；为空时使用初始化尺寸。
+            image_size：本次推理使用的输入尺寸；为空时使用所选场景的初始化尺寸。
+            scope：global 选择整帧模型，local（默认）选择局部模型。
         返回：当前帧全部人物姿态检测结果。
         副作用：执行一次模型推理，可能使用 GPU 计算资源。
         """
-        results = self._predict(frame, image_size)
+        results = self._predict(frame, image_size, scope)
         return self._parse_result(results[0]) if results else []
-
-    def detect_batch(
-        self,
-        frames: list[np.ndarray],
-        image_size: int | None = None,
-    ) -> list[list[PersonDetection]]:
-        """批量检测全局分片；每项结果对应输入的同序分片。"""
-        if not frames:
-            return []
-        results = self._predict(frames, image_size)
-        if len(results) != len(frames):
-            raise RuntimeError("全局分片模型结果数量与输入数量不一致")
-        return [self._parse_result(result) for result in results]
 
     def _predict(
         self,
-        source: np.ndarray | list[np.ndarray],
+        source: np.ndarray,
         image_size: int | None,
+        scope: str,
     ) -> Any:
-        scope = "global" if isinstance(source, list) else "local"
+        if scope not in {"global", "local"}:
+            raise ValueError("推理场景必须是 global 或 local")
+        if not isinstance(source, np.ndarray) or source.ndim != 3 or source.shape[2] != 3:
+            raise ValueError("单图推理需要一张 HWC BGR 图像，不支持批量输入")
         expected_size = self.image_size if scope == "global" else self.local_image_size
         size = image_size or expected_size
-        count = len(source) if isinstance(source, list) else 1
         if self.backend_by_scope[scope] == "tensorrt":
-            if size != expected_size or count > (self.global_batch_size if scope == "global" else 1):
-                raise ValueError("请求的输入尺寸或批量超出已校验的 TensorRT 范围")
+            if size != expected_size:
+                raise ValueError("请求的输入尺寸与静态 TensorRT engine 不匹配，请重新构建")
         predict_arguments: dict[str, Any] = {
             "source": source,
             "conf": self.confidence,

@@ -42,19 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
-    parser.add_argument("--imgsz", type=int, default=None)
-    parser.add_argument(
-        "--global-tile-size", type=int, default=640,
-        help="全局搜索分片的原图像素边长，默认 640",
-    )
-    parser.add_argument(
-        "--global-tile-overlap", type=int, default=128,
-        help="相邻全局分片重叠像素，默认 128",
-    )
-    parser.add_argument(
-        "--global-tile-batch-size", type=int, default=4,
-        help="一次全局模型推理的分片数量，默认 4",
-    )
+    parser.add_argument("--imgsz", type=int, default=None,
+                        help="整帧全局检测的正方形网络输入尺寸，默认 640；整图缩放补边后推理")
     parser.add_argument(
         "--local-imgsz",
         type=int,
@@ -132,9 +121,6 @@ def build_config(
         iou_threshold=arguments.iou,
         image_size=arguments.imgsz if arguments.imgsz is not None else 640,
         local_image_size=arguments.local_imgsz if arguments.local_imgsz is not None else 384,
-        global_tile_size=arguments.global_tile_size,
-        global_tile_overlap=arguments.global_tile_overlap,
-        global_tile_batch_size=arguments.global_tile_batch_size,
         device=arguments.device,
         roi_y_min=arguments.roi_y_min if arguments.roi_y_min is not None else 0,
         roi_y_max=arguments.roi_y_max,
