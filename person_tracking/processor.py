@@ -11,6 +11,7 @@ import numpy as np
 from .engine import FrameTrackingResult, PersonTrackingEngine
 from .tracking_config import PersonTrackingConfig
 from .video_writer import GStreamerVideoWriter, create_video_writer
+from .video_reader import GStreamerVideoCapture, create_video_capture
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,9 @@ class ProcessorConfig(PersonTrackingConfig):
     codec: str = "mp4v"
     encoder: str = "auto"
     video_bitrate: int = 8000000
+    decoder: str = "auto"
+    decode_prefetch: int = 2
+    gst_python: str = "/usr/bin/python3"
     output_max_width: int = 1920
     display: bool = True
     display_window_name: str = "人物检测与卡尔曼跟踪"
@@ -43,6 +47,12 @@ class ProcessorConfig(PersonTrackingConfig):
             raise ValueError("输出视频编码必须是四字符编码")
         if self.encoder not in {"auto", "opencv", "gstreamer"}:
             raise ValueError("输出编码后端必须为 auto、opencv 或 gstreamer")
+        if self.decoder not in {"auto", "opencv", "gstreamer"}:
+            raise ValueError("读取后端必须为 auto、opencv 或 gstreamer")
+        if self.decode_prefetch not in (1, 2):
+            raise ValueError("解码预读上限必须为 1 或 2 帧")
+        if not self.gst_python.strip():
+            raise ValueError("系统 Python 路径不能为空")
         if self.video_bitrate <= 0 or self.video_bitrate > 4294967295:
             raise ValueError("视频码率必须在 1 到 4294967295 bps 之间")
         if self.encoder == "gstreamer" and self.output_path.suffix.lower() != ".mp4":
@@ -75,6 +85,7 @@ class ProcessingStats:
     output_path: Path
     encoder_finalize_time_ms: float
     processing_fps_with_finalize: float
+    reader_finalize_time_ms: float
 
 
 
@@ -98,9 +109,8 @@ class PersonVideoProcessor(PersonTrackingEngine):
             视频无法打开、ROI 无效或输出编码器无法创建时抛出异常。
         副作用：读取输入视频、执行模型推理并写入输出视频文件。
         """
-        capture = cv2.VideoCapture(str(self.config.input_path))
-        if not capture.isOpened():
-            raise RuntimeError(f"无法打开输入视频：{self.config.input_path}")
+        capture = create_video_capture(self.config.input_path, self.config.decoder,
+                                       self.config.decode_prefetch, self.config.gst_python)
         writer: cv2.VideoWriter | GStreamerVideoWriter | None = None
         display_window_opened = False
         try:
@@ -190,6 +200,11 @@ class PersonVideoProcessor(PersonTrackingEngine):
                     "同步输出帧数与处理帧数不一致："
                     f"处理 {total_frames} 帧，写入 {written_frames} 帧"
                 )
+            reader_finalize_started_at = time.perf_counter()
+            if isinstance(capture, GStreamerVideoCapture):
+                capture.log_statistics()
+            capture.release()
+            capture = None
             finalize_started_at = time.perf_counter()
             writer.release()
             writer = None
@@ -221,9 +236,11 @@ class PersonVideoProcessor(PersonTrackingEngine):
                 output_path=self.config.output_path,
                 encoder_finalize_time_ms=(output_finished_at - finalize_started_at) * 1000,
                 processing_fps_with_finalize=total_frames / (output_finished_at - processing_started_at),
+                reader_finalize_time_ms=(finalize_started_at - reader_finalize_started_at) * 1000,
             )
         finally:
-            capture.release()
+            if capture is not None:
+                capture.release()
             if writer is not None:
                 if isinstance(writer, GStreamerVideoWriter):
                     writer.abort()
@@ -337,7 +354,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
 
     @staticmethod
     def _read_video_metadata(
-        capture: cv2.VideoCapture,
+        capture: cv2.VideoCapture | GStreamerVideoCapture,
     ) -> tuple[float, int, int]:
         """
         作用：读取输入视频帧率和画面尺寸。
@@ -382,7 +399,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
 
     @staticmethod
     def _frame_timestamp_ms(
-        capture: cv2.VideoCapture,
+        capture: cv2.VideoCapture | GStreamerVideoCapture,
         frame_index: int,
         fps: float,
         last_timestamp_ms: float,
@@ -398,6 +415,8 @@ class PersonVideoProcessor(PersonTrackingEngine):
         """
         container_timestamp_ms = float(capture.get(cv2.CAP_PROP_POS_MSEC))
         calculated_timestamp_ms = frame_index * 1000.0 / fps
-        if container_timestamp_ms > last_timestamp_ms:
+        if np.isfinite(container_timestamp_ms) and container_timestamp_ms > last_timestamp_ms:
             return container_timestamp_ms
+        if frame_index == 0:
+            return 0.0
         return max(calculated_timestamp_ms, last_timestamp_ms + 1000.0 / fps)

@@ -141,7 +141,7 @@ uv run python -m person_tracking --input /path/to/video.mp4 --backend tensorrt \
 - `gstreamer`：强制 Jetson 硬件 H.264 / MP4 输出，依赖不可用或编码失败时直接报错。
 - `opencv`：使用原有 OpenCV 输出，`--codec` 默认 `mp4v`。
 
-在目标 Jetson 执行（输入视频仍通过现有 OpenCV 读取）：
+在目标 Jetson 执行（读取默认按下一节自动选择，也可用 `--decoder opencv` 做读取对照）：
 
 ```bash
 uv run python -m person_tracking \
@@ -163,6 +163,34 @@ Windows 本地测试不验证 NVENC。将修改同步到 Jetson 后，可运行�
 ```bash
 RUN_JETSON_GSTREAMER_TEST=1 uv run python -m unittest discover -s tests -p test_video_writer.py -v
 ```
+
+### Jetson NVDEC 硬件读取及有限预读
+
+`--decoder auto|opencv|gstreamer` 控制读取，与模型 `--backend`、输出 `--encoder` 独立。默认 `auto` 在 Jetson 上对 H.264/H.265 的 MP4/MOV 文件优先使用 NVDEC；其他平台、格式或缺少系统依赖时打印原因并使用 OpenCV。强制 `gstreamer` 不可用时报错。解码辅助进程启动后发生错误不会中途回退或重新从头读视频。
+
+```bash
+uv run python -m person_tracking \
+  --input camera_20260910_143934.mp4 \
+  --output outputs/camera_20260910_143934-nvdec-nvenc.mp4 \
+  --decoder gstreamer --decode-prefetch 2 \
+  --encoder gstreamer --video-bitrate 8000000 --no-display
+```
+
+实现通过 `/usr/bin/python3` 运行独立 GI 辅助进程，使用 `nvv4l2decoder → nvvidconv → appsink`。`--gst-python` 可指定其他提供 JetPack GI 的系统解释器；需要 `Gst`、`GstApp`、`GstVideo` 1.0 命名空间，不要求项目虚拟环境安装 GI，也不需要重新编译 OpenCV。OpenCV 只在启动时读取输入元数据，之后图像由 NVDEC 解码。
+
+保持原始分辨率；例如 4K 视频不会在读取阶段缩为 1080p。`--decode-prefetch 1|2` 设置 appsink 队列上限，默认 2；满时阻塞、不丢帧。解码器内部的参考帧、转换中正在处理的帧不包含在这个队列上限中。像素经 `/dev/shm` 中的一块匿名共享内存传输（4K BGRx 约 33 MB），主进程转为独立 BGR 数组后才请求下一帧；控制 socket 单独传帧序和纳秒 PTS，NVIDIA 的控制台日志不会混入像素。没有在 Python 中无限堆积帧或预读整个视频。
+
+跟踪使用原始 PTS 间隔并把首个有效帧对齐视频起点；缺失或不递增的时间戳沿用单调回退策略。不会将约 25.0353 FPS 的平均帧率直接当成整数 25 来重建正常 PTS。输出仍保持已有固定帧率 MP4 策略，不保留变帧率容器的逐帧 PTS；硬件颜色转换或实际时间戳差异可能使跟踪结果与旧路径略有差异，应验收结果。
+
+新增日志包括“等待解码样本”“共享内存复制”“BGR 转换”和缺失 PTS 帧数。等待样本反映缓冲与消费情况，不能当成纯 NVDEC 解码延迟；主流程的读取耗时还包含 IPC 等待和 BGR 转换。流水线各阶段会重叠，性能验收使用“含收尾实际处理速度”，该值包含读取器和编码器收尾。
+
+真机测试包含真实 NVENC→NVDEC 往返、非均匀 PTS、帧序/尺寸和提前停止后的进程清理：
+
+```bash
+RUN_JETSON_GSTREAMER_TEST=1 uv run python -m unittest discover -s tests -p 'test_video_*.py' -v
+```
+
+Windows 会跳过 NVDEC/NVENC 真机测试，但执行共享内存、分段控制消息、行填充、帧序/PTS、错误/超时及原 OpenCV 输出测试。部署后对同一原始视频分别运行 `--decoder opencv --encoder gstreamer` 和 `--decoder gstreamer --encoder gstreamer`，再比较预读 1/2 帧。保持模型和其他参数一致，各运行三次；检查总帧数、时长、颜色和检测结果，并比较含收尾 FPS。输入完整读完时还会校验读取帧数与输入容器元数据，异常截断不会作为正常结束报告。
 
 在同一视频上顺序运行 PT 和 TensorRT，预热后报告平均/P95 延迟、全局/局部模型帧处理耗时、结果框 IoU、类别一致率和检测框有无差异：
 

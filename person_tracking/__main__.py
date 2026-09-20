@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--global-engine", type=Path, help="默认 <PT名称>.global.engine")
     parser.add_argument("--local-engine", type=Path, help="默认 <PT名称>.local.engine")
     parser.add_argument("--input", type=Path, required=True, help="输入视频路径")
+    parser.add_argument("--decoder", choices=("auto", "opencv", "gstreamer"), default="auto",
+                        help="读取后端：Jetson H.264/H.265 MP4/MOV 优先 NVDEC；Windows 使用 OpenCV")
+    parser.add_argument("--decode-prefetch", type=int, choices=(1, 2), default=2,
+                        help="NVDEC appsink 预读队列上限，默认 2 帧，满时等待、不丢帧")
+    parser.add_argument("--gst-python", default="/usr/bin/python3",
+                        help="提供 JetPack GStreamer GI 的系统 Python，默认 /usr/bin/python3")
     parser.add_argument("--output", type=Path, default=None, help="输出视频路径；默认保存到 outputs 目录")
     parser.add_argument("--output-max-width", type=int, default=1920,
                         help="输出最大宽度，默认 1920；0 保留原尺寸，编码尺寸对齐偶数；识别仍用原图")
@@ -120,6 +126,9 @@ def build_config(
         global_engine_path=arguments.global_engine,
         local_engine_path=arguments.local_engine,
         input_path=input_path,
+        decoder=arguments.decoder,
+        decode_prefetch=arguments.decode_prefetch,
+        gst_python=arguments.gst_python,
         output_path=output_path,
         output_max_width=arguments.output_max_width,
         warmup_detections=arguments.warmup_detections,
@@ -182,7 +191,8 @@ def main() -> int:
         stats.output_path,
     )
     logging.getLogger(__name__).info(
-        "编码器收尾及校验=%.2fms，含收尾实际处理速度=%.2ffps（不含初始化）",
+        "读取器收尾=%.2fms，编码器收尾及校验=%.2fms，含收尾实际处理速度=%.2ffps（不含初始化）",
+        stats.reader_finalize_time_ms,
         stats.encoder_finalize_time_ms,
         stats.processing_fps_with_finalize,
     )

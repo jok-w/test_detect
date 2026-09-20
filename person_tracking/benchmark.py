@@ -15,7 +15,9 @@ import numpy as np
 from .__main__ import build_config, build_parser as tracking_parser
 from .engine import PersonTrackingEngine
 from .model_artifacts import artifact_paths
+from .processor import PersonVideoProcessor
 from .types import BoundingBox, bbox_iou
+from .video_reader import GStreamerVideoCapture, create_video_capture
 
 
 def timing_summary(values: list[float]) -> dict:
@@ -45,13 +47,14 @@ def run_video(config, limit: int, warmup: int) -> dict:
         for warming, count in ((True, warmup), (False, limit)):
             if not count:
                 continue
-            capture = cv2.VideoCapture(str(config.input_path))
-            if not capture.isOpened():
-                raise RuntimeError(f"无法读取视频：{config.input_path}")
+            capture = create_video_capture(config.input_path, config.decoder,
+                                           config.decode_prefetch, config.gst_python)
+            actual_decoder = "gstreamer" if isinstance(capture, GStreamerVideoCapture) else "opencv"
             fps = capture.get(cv2.CAP_PROP_FPS)
             if not np.isfinite(fps) or fps <= 0:
                 raise RuntimeError("输入视频缺少有效帧率")
             engine.reset()
+            last_timestamp_ms = -1.0
             for index in range(count):
                 synchronize()
                 started = perf_counter()
@@ -59,7 +62,10 @@ def run_video(config, limit: int, warmup: int) -> dict:
                 if not ok:
                     break
                 inference_started = perf_counter()
-                result, used_model = engine.process_frame(frame, index * 1000.0 / fps)
+                timestamp_ms = PersonVideoProcessor._frame_timestamp_ms(
+                    capture, index, fps, last_timestamp_ms)
+                last_timestamp_ms = timestamp_ms
+                result, used_model = engine.process_frame(frame, timestamp_ms)
                 synchronize()
                 finished = perf_counter()
                 if not warming:
@@ -74,6 +80,7 @@ def run_video(config, limit: int, warmup: int) -> dict:
         read_processing = [r["read_and_processing_ms"] for r in records]
         return {
             "requested_backend": config.backend, "actual_backends": detector.backend_by_scope,
+            "actual_decoder": actual_decoder,
             "models": detector.model_paths, "device": device, "frames": len(records),
             "processing": timing_summary(processing), "read_and_processing": timing_summary(read_processing),
             "fps_without_drawing_encoding": 1000.0 / float(np.mean(read_processing)),
