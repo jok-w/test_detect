@@ -133,6 +133,37 @@ uv run python -m person_tracking --input /path/to/video.mp4 --backend tensorrt \
 
 ## 性能与结果对照
 
+### Jetson 硬件视频输出
+
+`--encoder` 控制视频输出，与模型推理的 `--backend` 独立：
+
+- `auto`（默认）：检测到 Jetson Linux 且输出为 MP4 时，检查 GStreamer 所需插件并使用 `nvv4l2h264enc` 硬件 H.264 编码。插件缺失时打印原因并回退 OpenCV；其他平台及非 MP4 输出使用 OpenCV。
+- `gstreamer`：强制 Jetson 硬件 H.264 / MP4 输出，依赖不可用或编码失败时直接报错。
+- `opencv`：使用原有 OpenCV 输出，`--codec` 默认 `mp4v`。
+
+在目标 Jetson 执行（输入视频仍通过现有 OpenCV 读取）：
+
+```bash
+uv run python -m person_tracking \
+  --input camera_20260910_143934.mp4 \
+  --output outputs/camera_20260910_143934-nvenc.mp4 \
+  --encoder gstreamer --video-bitrate 8000000 --no-display
+```
+
+`--video-bitrate` 单位为 bps，默认 8000000（8 Mbps），仅用于硬件输出；它与原 mp4v 编码的质量设置并不等价，应检查细节和标注清晰度。可调大码率改善画质。`--output-max-width` 默认 1920，设为 0 保留原始输出尺寸。输出缩放不改变模型收到的原始图像。
+
+硬件路径使用独立 `gst-launch-1.0` 进程，不依赖项目 OpenCV 的 `GStreamer: YES` 或 Python GI bindings，也不需要替换现有 OpenCV。需要系统的 `fdsrc`、`rawvideoparse`、`nvvidconv`、`nvv4l2h264enc`、`h264parse`、`qtmux` 和 `filesink`。实现将 BGR 转为 BGRx，通过有背压的管道依次提交所有帧，再由 `nvvidconv` 转 NV12 并硬件编码。[NVIDIA 编解码组件](https://docs.nvidia.com/jetson/archives/r36.4/DeveloperGuide/SD/Multimedia/AcceleratedGstreamer.html)、[GStreamer rawvideoparse](https://gstreamer.freedesktop.org/documentation/rawparse/rawvideoparse.html)。
+
+每帧写入表示已提交到编码管道，不等于该帧已完成落盘。结束或按 Q/Esc 时关闭输入，等待 EOS 和 MP4 收尾，然后校验输出元数据的帧数、帧率和尺寸；此校验不逐帧解码。编码启动后的错误不会中途切换后端，避免生成混合或缺帧输出；写入或收尾连续等待超过 30 秒时报错，异常中断的文件可能不完整。
+
+日志会打印实际视频输出后端、分项耗时，以及新增的“编码器收尾及校验”和“含收尾实际处理速度”。比较整体速度时优先使用含收尾 FPS，它包括读取、检测、绘图、显示、管道提交、编码收尾及硬件输出元数据检查，不含初始化。原来的平均单帧分项不含收尾，不能把管道提交耗时当成独立硬件编码延迟。
+
+Windows 本地测试不验证 NVENC。将修改同步到 Jetson 后，可运行真实管道集成测试，它会验证包含空格和中文的路径、非整数帧率、输出尺寸、逐帧解码后的数量与顺序：
+
+```bash
+RUN_JETSON_GSTREAMER_TEST=1 uv run python -m unittest discover -s tests -p test_video_writer.py -v
+```
+
 在同一视频上顺序运行 PT 和 TensorRT，预热后报告平均/P95 延迟、全局/局部模型帧处理耗时、结果框 IoU、类别一致率和检测框有无差异：
 
 ```bash

@@ -64,7 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="固定人物纵向区域终点；为空时使用视频底部",
     )
-    parser.add_argument("--codec", default="mp4v")
+    parser.add_argument("--codec", default="mp4v", help="OpenCV 输出 FourCC；硬件输出固定 H.264")
+    parser.add_argument("--encoder", choices=("auto", "opencv", "gstreamer"), default="auto",
+                        help="视频输出后端：Jetson MP4 自动优先 NVENC；Windows 使用 OpenCV")
+    parser.add_argument("--video-bitrate", type=int, default=8000000,
+                        help="硬件 H.264 输出码率，单位 bps，默认 8000000")
     parser.add_argument("--max-prediction-ms", type=float, default=500.0)
     parser.add_argument("--global-recovery-ms", type=float, default=300.0)
     parser.add_argument("--recovery-misses", type=int, default=3)
@@ -128,6 +132,8 @@ def build_config(
         roi_y_min=arguments.roi_y_min if arguments.roi_y_min is not None else 0,
         roi_y_max=arguments.roi_y_max,
         codec=arguments.codec,
+        encoder=arguments.encoder,
+        video_bitrate=arguments.video_bitrate,
         max_prediction_ms=arguments.max_prediction_ms,
         global_recovery_ms=arguments.global_recovery_ms,
         recovery_misses=arguments.recovery_misses,
@@ -159,7 +165,7 @@ def main() -> int:
     config = build_config(arguments)
     stats = PersonVideoProcessor(config).process()
     logging.getLogger(__name__).info(
-        "视频处理完成：处理帧数=%s，同步写入帧数=%s，模型帧数=%s，"
+        "视频处理完成：处理帧数=%s，写入帧数=%s，模型帧数=%s，"
         "全局模型帧数=%s，局部模型帧数=%s，卡尔曼预测帧数=%s，"
         "无人物框帧数=%s，平均单帧耗时=%.2fms，"
         "等效处理速度=%.2ffps，用户提前停止=%s，输出=%s",
@@ -174,6 +180,11 @@ def main() -> int:
         stats.average_processing_fps,
         stats.stopped_by_user,
         stats.output_path,
+    )
+    logging.getLogger(__name__).info(
+        "编码器收尾及校验=%.2fms，含收尾实际处理速度=%.2ffps（不含初始化）",
+        stats.encoder_finalize_time_ms,
+        stats.processing_fps_with_finalize,
     )
     logging.getLogger(__name__).info(
         "平均分项耗时：读取=%.2fms，检测跟踪=%.2fms，缩放绘图=%.2fms，"

@@ -10,6 +10,7 @@ import numpy as np
 
 from .engine import FrameTrackingResult, PersonTrackingEngine
 from .tracking_config import PersonTrackingConfig
+from .video_writer import GStreamerVideoWriter, create_video_writer
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ class ProcessorConfig(PersonTrackingConfig):
     input_path: Path
     output_path: Path
     codec: str = "mp4v"
+    encoder: str = "auto"
+    video_bitrate: int = 8000000
     output_max_width: int = 1920
     display: bool = True
     display_window_name: str = "人物检测与卡尔曼跟踪"
@@ -38,6 +41,12 @@ class ProcessorConfig(PersonTrackingConfig):
             raise ValueError("输出视频不能覆盖输入视频")
         if len(self.codec) != 4:
             raise ValueError("输出视频编码必须是四字符编码")
+        if self.encoder not in {"auto", "opencv", "gstreamer"}:
+            raise ValueError("输出编码后端必须为 auto、opencv 或 gstreamer")
+        if self.video_bitrate <= 0 or self.video_bitrate > 4294967295:
+            raise ValueError("视频码率必须在 1 到 4294967295 bps 之间")
+        if self.encoder == "gstreamer" and self.output_path.suffix.lower() != ".mp4":
+            raise ValueError("GStreamer 硬件输出需要 .mp4 文件")
         if self.output_max_width < 0 or self.output_max_width == 1:
             raise ValueError("输出最大宽度必须为 0 或至少 2 像素")
         if self.display and not self.display_window_name.strip():
@@ -64,6 +73,8 @@ class ProcessingStats:
     average_encoding_time_ms: float
     stopped_by_user: bool
     output_path: Path
+    encoder_finalize_time_ms: float
+    processing_fps_with_finalize: float
 
 
 
@@ -90,14 +101,14 @@ class PersonVideoProcessor(PersonTrackingEngine):
         capture = cv2.VideoCapture(str(self.config.input_path))
         if not capture.isOpened():
             raise RuntimeError(f"无法打开输入视频：{self.config.input_path}")
-        writer: cv2.VideoWriter | None = None
+        writer: cv2.VideoWriter | GStreamerVideoWriter | None = None
         display_window_opened = False
         try:
             fps, frame_width, frame_height = self._read_video_metadata(capture)
             roi_y_max = self._resolve_roi_y_max(frame_height)
             output_size = self._resolve_output_size(frame_width, frame_height)
-            logger.info("视频输入=%sx%s，输出=%sx%s，fps=%.3f，编码=%s",
-                        frame_width, frame_height, *output_size, fps, self.config.codec)
+            logger.info("视频输入=%sx%s，输出=%sx%s，fps=%.3f",
+                        frame_width, frame_height, *output_size, fps)
             self.config.output_path.parent.mkdir(parents=True, exist_ok=True)
             writer = self._create_writer(fps, *output_size)
             if self.config.display:
@@ -115,6 +126,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
             display_seconds = encoding_seconds = 0.0
             stopped_by_user = False
             last_timestamp_ms = -1.0
+            processing_started_at = time.perf_counter()
             while True:
                 frame_started_at = time.perf_counter()
                 read_succeeded, frame = capture.read()
@@ -178,6 +190,10 @@ class PersonVideoProcessor(PersonTrackingEngine):
                     "同步输出帧数与处理帧数不一致："
                     f"处理 {total_frames} 帧，写入 {written_frames} 帧"
                 )
+            finalize_started_at = time.perf_counter()
+            writer.release()
+            writer = None
+            output_finished_at = time.perf_counter()
             average_frame_time_ms = (
                 total_processing_seconds * 1000.0 / total_frames
             )
@@ -203,11 +219,16 @@ class PersonVideoProcessor(PersonTrackingEngine):
                 average_encoding_time_ms=encoding_seconds * 1000.0 / total_frames,
                 stopped_by_user=stopped_by_user,
                 output_path=self.config.output_path,
+                encoder_finalize_time_ms=(output_finished_at - finalize_started_at) * 1000,
+                processing_fps_with_finalize=total_frames / (output_finished_at - processing_started_at),
             )
         finally:
             capture.release()
             if writer is not None:
-                writer.release()
+                if isinstance(writer, GStreamerVideoWriter):
+                    writer.abort()
+                else:
+                    writer.release()
             if display_window_opened:
                 self._close_display_window()
 
@@ -294,7 +315,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
 
     @staticmethod
     def _write_frame_synchronously(
-        writer: cv2.VideoWriter,
+        writer: cv2.VideoWriter | GStreamerVideoWriter,
         frame: np.ndarray,
         frame_index: int,
     ) -> None:
@@ -309,7 +330,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
             输出视频编码器已经关闭时抛出 RuntimeError。
         副作用：向输出视频写入一个画面帧。
         """
-        if not writer.isOpened():
+        if not isinstance(writer, GStreamerVideoWriter) and not writer.isOpened():
             raise RuntimeError(f"写入第 {frame_index} 帧前视频编码器已经关闭")
         writer.write(frame)
 
@@ -329,7 +350,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         frame_width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
         frame_height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if fps <= 0.0:
+        if not np.isfinite(fps) or fps <= 0.0:
             raise RuntimeError("输入视频缺少有效帧率")
         if frame_width <= 0 or frame_height <= 0:
             raise RuntimeError("输入视频缺少有效画面尺寸")
@@ -341,7 +362,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
         fps: float,
         frame_width: int,
         frame_height: int,
-    ) -> cv2.VideoWriter:
+    ) -> cv2.VideoWriter | GStreamerVideoWriter:
         """
         作用：按输入帧率和指定输出画面尺寸创建编码器。
         参数：
@@ -353,20 +374,10 @@ class PersonVideoProcessor(PersonTrackingEngine):
             系统不支持指定编码或输出路径无法写入时抛出 RuntimeError。
         副作用：创建或覆盖输出视频文件。
         """
-        fourcc = cv2.VideoWriter_fourcc(*self.config.codec)
-        writer = cv2.VideoWriter(
-            str(self.config.output_path),
-            fourcc,
-            fps,
-            (frame_width, frame_height),
+        return create_video_writer(
+            self.config.output_path, fps, frame_width, frame_height,
+            self.config.encoder, self.config.codec, self.config.video_bitrate,
         )
-        if not writer.isOpened():
-            writer.release()
-            raise RuntimeError(
-                f"无法创建输出视频，请检查编码 {self.config.codec} 和路径："
-                f"{self.config.output_path}"
-            )
-        return writer
 
 
     @staticmethod

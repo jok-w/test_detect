@@ -11,6 +11,7 @@ from person_tracking.__main__ import build_config, build_parser
 from person_tracking.engine import FrameTrackingResult
 from person_tracking.processor import PersonVideoProcessor, ProcessorConfig
 from person_tracking.types import BoundingBox, CropWindow
+from person_tracking.video_writer import GStreamerVideoWriter
 
 
 class OutputVideoTests(unittest.TestCase):
@@ -83,6 +84,9 @@ class OutputVideoTests(unittest.TestCase):
                               stats.average_drawing_time_ms, stats.average_display_time_ms,
                               stats.average_encoding_time_ms]
                 self.assertAlmostEqual(sum(components), stats.average_frame_time_ms)
+                self.assertGreaterEqual(stats.encoder_finalize_time_ms, 0)
+                self.assertGreater(stats.processing_fps_with_finalize, 0)
+                self.assertLessEqual(stats.processing_fps_with_finalize, stats.average_processing_fps)
                 capture = cv2.VideoCapture(str(output))
                 try:
                     self.assertEqual((int(capture.get(3)), int(capture.get(4))), size)
@@ -104,6 +108,38 @@ class OutputVideoTests(unittest.TestCase):
         _, text, (x, _), _ = draw_text.call_args_list[0].args
         text_width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 3)[0][0]
         self.assertLessEqual(x + text_width, 1920 - 4)
+
+    def test_early_stop_drains_encoder_and_finalization_failure_never_returns_success(self):
+        for fail_finalize in (False, True):
+            with self.subTest(fail_finalize=fail_finalize):
+                processor = self.make_processor(display=False)
+                frame = np.zeros((180, 320, 3), np.uint8)
+                capture = Mock()
+                capture.read.return_value = (True, frame)
+                capture.get.side_effect = lambda prop: {
+                    cv2.CAP_PROP_FPS: 25, cv2.CAP_PROP_FRAME_WIDTH: 320,
+                    cv2.CAP_PROP_FRAME_HEIGHT: 180, cv2.CAP_PROP_POS_MSEC: 0,
+                }[prop]
+                writer = Mock(spec=GStreamerVideoWriter)
+                if fail_finalize:
+                    writer.release.side_effect = RuntimeError("编码收尾失败")
+                processor._create_writer = Mock(return_value=writer)
+                processor._display_frame = Mock(side_effect=[True, False])
+                result = FrameTrackingResult(None, "none", None, None, "waiting", "global", None)
+                processor.process_frame = Mock(return_value=(result, True))
+                with patch("person_tracking.processor.cv2.VideoCapture", return_value=capture):
+                    if fail_finalize:
+                        with self.assertRaisesRegex(RuntimeError, "编码收尾失败"):
+                            processor.process()
+                        writer.abort.assert_called_once()
+                    else:
+                        stats = processor.process()
+                        self.assertTrue(stats.stopped_by_user)
+                        self.assertEqual((stats.total_frames, stats.written_frames), (2, 2))
+                        writer.abort.assert_not_called()
+                writer.release.assert_called_once()
+                self.assertEqual(writer.write.call_count, 2)
+                capture.release.assert_called_once()
 
 
 if __name__ == "__main__":
