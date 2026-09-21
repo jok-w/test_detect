@@ -71,7 +71,10 @@ class OutputVideoTests(unittest.TestCase):
                 writer.write(np.full((180, 320, 3), value, dtype=np.uint8))
             writer.release()
             for width, size in [(160, (160, 90)), (0, (320, 180))]:
-                processor = self.make_processor(output_max_width=width, display=False)
+                # This test covers the portable OpenCV path on every host.
+                # Actual NVENC/NVDEC are covered by the opt-in hardware integration tests.
+                processor = self.make_processor(output_max_width=width, display=False,
+                                                decoder="opencv", encoder="opencv")
                 output = Path(folder) / f"output-{width}.mp4"
                 processor.config = replace(processor.config, input_path=source, output_path=output)
                 result = FrameTrackingResult(None, "none", None, None, "waiting", "global", None)
@@ -127,7 +130,8 @@ class OutputVideoTests(unittest.TestCase):
                 processor._display_frame = Mock(side_effect=[True, False])
                 result = FrameTrackingResult(None, "none", None, None, "waiting", "global", None)
                 processor.process_frame = Mock(return_value=(result, True))
-                with patch("person_tracking.processor.cv2.VideoCapture", return_value=capture):
+                # Isolate processing lifecycle from platform-dependent reader selection.
+                with patch("person_tracking.processor.create_video_capture", return_value=capture):
                     if fail_finalize:
                         with self.assertRaisesRegex(RuntimeError, "编码收尾失败"):
                             processor.process()

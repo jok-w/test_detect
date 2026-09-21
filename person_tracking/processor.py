@@ -11,7 +11,7 @@ import numpy as np
 from .engine import FrameTrackingResult, PersonTrackingEngine
 from .tracking_config import PersonTrackingConfig
 from .video_writer import GStreamerVideoWriter, create_video_writer
-from .video_reader import GStreamerVideoCapture, create_video_capture
+from .video_reader import GStreamerVideoCapture, PreparedVideoCapture, create_video_capture
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ class ProcessorConfig(PersonTrackingConfig):
     video_bitrate: int = 8000000
     decoder: str = "auto"
     decode_prefetch: int = 2
+    read_ahead: int = 2
     gst_python: str = "/usr/bin/python3"
     output_max_width: int = 1920
     display: bool = True
@@ -51,6 +52,8 @@ class ProcessorConfig(PersonTrackingConfig):
             raise ValueError("读取后端必须为 auto、opencv 或 gstreamer")
         if self.decode_prefetch not in (1, 2):
             raise ValueError("解码预读上限必须为 1 或 2 帧")
+        if self.read_ahead not in (0, 1, 2):
+            raise ValueError("完整帧预读上限必须为 0、1 或 2 帧")
         if not self.gst_python.strip():
             raise ValueError("系统 Python 路径不能为空")
         if self.video_bitrate <= 0 or self.video_bitrate > 4294967295:
@@ -110,7 +113,8 @@ class PersonVideoProcessor(PersonTrackingEngine):
         副作用：读取输入视频、执行模型推理并写入输出视频文件。
         """
         capture = create_video_capture(self.config.input_path, self.config.decoder,
-                                       self.config.decode_prefetch, self.config.gst_python)
+                                       self.config.decode_prefetch, self.config.gst_python,
+                                       self.config.read_ahead)
         writer: cv2.VideoWriter | GStreamerVideoWriter | None = None
         display_window_opened = False
         try:
@@ -201,7 +205,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
                     f"处理 {total_frames} 帧，写入 {written_frames} 帧"
                 )
             reader_finalize_started_at = time.perf_counter()
-            if isinstance(capture, GStreamerVideoCapture):
+            if isinstance(capture, (GStreamerVideoCapture, PreparedVideoCapture)):
                 capture.log_statistics()
             capture.release()
             capture = None
@@ -354,7 +358,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
 
     @staticmethod
     def _read_video_metadata(
-        capture: cv2.VideoCapture | GStreamerVideoCapture,
+        capture: cv2.VideoCapture | GStreamerVideoCapture | PreparedVideoCapture,
     ) -> tuple[float, int, int]:
         """
         作用：读取输入视频帧率和画面尺寸。
@@ -399,7 +403,7 @@ class PersonVideoProcessor(PersonTrackingEngine):
 
     @staticmethod
     def _frame_timestamp_ms(
-        capture: cv2.VideoCapture | GStreamerVideoCapture,
+        capture: cv2.VideoCapture | GStreamerVideoCapture | PreparedVideoCapture,
         frame_index: int,
         fps: float,
         last_timestamp_ms: float,

@@ -30,6 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="读取后端：Jetson H.264/H.265 MP4/MOV 优先 NVDEC；Windows 使用 OpenCV")
     parser.add_argument("--decode-prefetch", type=int, choices=(1, 2), default=2,
                         help="NVDEC appsink 预读队列上限，默认 2 帧，满时等待、不丢帧")
+    parser.add_argument("--read-ahead", type=int, choices=(0, 1, 2), default=2,
+                        help="NVDEC 完整 BGR 帧后台预读上限，默认 2；0 使用上一版同步准备路径")
     parser.add_argument("--gst-python", default="/usr/bin/python3",
                         help="提供 JetPack GStreamer GI 的系统 Python，默认 /usr/bin/python3")
     parser.add_argument("--output", type=Path, default=None, help="输出视频路径；默认保存到 outputs 目录")
@@ -128,6 +130,7 @@ def build_config(
         input_path=input_path,
         decoder=arguments.decoder,
         decode_prefetch=arguments.decode_prefetch,
+        read_ahead=arguments.read_ahead,
         gst_python=arguments.gst_python,
         output_path=output_path,
         output_max_width=arguments.output_max_width,

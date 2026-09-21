@@ -5,10 +5,12 @@ import json
 import logging
 import math
 import mmap
+import queue
 import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -184,6 +186,14 @@ class GStreamerVideoCapture:
                 if resource is not None:
                     resource.close()
 
+    def cancel_pending_read(self):
+        """Wake the sole reading thread without closing its in-use mmap."""
+        if self._control is not None:
+            try:
+                self._control.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def log_statistics(self):
         if self.frames:
             logger.info("NVDEC 读取统计：帧数=%s，等待解码样本=%.2fms，共享内存复制=%.2fms，"
@@ -192,7 +202,138 @@ class GStreamerVideoCapture:
                         self.convert_ms / self.frames, self.missing_pts)
 
 
-def create_video_capture(path: Path, decoder="auto", prefetch=2, python="/usr/bin/python3"):
+class PreparedVideoCapture:
+    """Prepare independently owned BGR frames ahead of processing, with bounded credits.
+
+One producer owns source.read/release and the shared slot. Queue + in-flight read
+never exceeds capacity; each packet carries the PTS/statistics for that exact frame.
+"""
+
+    def __init__(self, source: GStreamerVideoCapture, capacity: int = 2):
+        if capacity not in (1, 2):
+            raise ValueError("完整帧预读必须为 1 或 2 帧")
+        self.source = source
+        self.capacity = capacity
+        self._metadata = {prop: source.get(prop) for prop in (
+            cv2.CAP_PROP_FPS, cv2.CAP_PROP_FRAME_WIDTH,
+            cv2.CAP_PROP_FRAME_HEIGHT, cv2.CAP_PROP_FRAME_COUNT)}
+        self._queue = queue.Queue(maxsize=capacity)
+        self._credits = threading.BoundedSemaphore(capacity)
+        self._stop = threading.Event()
+        self._thread = None
+        self._closed = self._eos = False
+        self.frames = self.missing_pts = 0
+        self.pts_ms = float("nan")
+        self.pull_ms = self.copy_ms = self.convert_ms = self.prepare_ms = self.wait_ms = 0.0
+
+    def _produce(self):
+        prepare_ms = 0.0
+        try:
+            while not self._stop.is_set():
+                if not self._credits.acquire(timeout=0.1):
+                    continue
+                if self._stop.is_set():
+                    break
+                started = time.perf_counter()
+                try:
+                    ok, frame = self.source.read()
+                    prepare_ms += (time.perf_counter() - started) * 1000
+                    if ok:
+                        packet = ("frame", frame, self.source.get(cv2.CAP_PROP_POS_MSEC),
+                                  (self.source.pull_ms, self.source.copy_ms,
+                                   self.source.convert_ms, self.source.missing_pts, prepare_ms))
+                    else:
+                        packet = ("eos",)
+                except Exception as error:
+                    packet = ("error", error)
+                if self._stop.is_set():
+                    break
+                # A credit was reserved before allocating/preparing the frame.
+                self._queue.put_nowait(packet)
+                if packet[0] != "frame":
+                    break
+                # Do not retain the previous image while preparing another one.
+                del packet, frame
+        finally:
+            self.source.release()
+
+    def isOpened(self):
+        return not self._closed
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_POS_MSEC:
+            return self.pts_ms
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return self.frames
+        return self._metadata.get(prop, 0)
+
+    def read(self):
+        if self._closed:
+            raise RuntimeError("完整帧预读器已关闭")
+        if self._eos:
+            return False, None
+        started = time.perf_counter()
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._produce, name="nvdec-frame-preparation", daemon=True)
+            self._thread.start()
+        try:
+            deadline = time.monotonic() + 40
+            while True:
+                try:
+                    packet = self._queue.get(timeout=0.1)
+                    break
+                except queue.Empty:
+                    if not self._thread.is_alive():
+                        raise RuntimeError("完整帧预读线程异常结束，未收到 EOS")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("等待完整 BGR 帧超时")
+            self._credits.release()
+            if packet[0] == "error":
+                raise RuntimeError(f"完整帧预读失败：{packet[1]}") from packet[1]
+            if packet[0] == "eos":
+                self._eos = True
+                return False, None
+            self.pts_ms = packet[2]
+            (self.pull_ms, self.copy_ms, self.convert_ms,
+             self.missing_pts, self.prepare_ms) = packet[3]
+            self.frames += 1
+            self.wait_ms += (time.perf_counter() - started) * 1000
+            return True, packet[1]
+        except BaseException:
+            self.release()
+            raise
+
+    def release(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        if self._thread is None:
+            self.source.release()
+        else:
+            if self._thread.is_alive():
+                self.source.cancel_pending_read()
+                self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                # Do not unmap memory that a native conversion could still be reading.
+                raise RuntimeError("完整帧预读线程未能及时退出")
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def log_statistics(self):
+        if self.frames:
+            logger.info("NVDEC 完整帧预读：消费帧数=%s，上限=%s，主线程取帧等待=%.2fms，"
+                        "后台准备=%.2fms，等待解码样本=%.2fms，共享内存复制=%.2fms，"
+                        "BGR 转换=%.2fms，缺失 PTS 帧数=%s（每消费帧平均，后台阶段与检测重叠，不可相加）",
+                        self.frames, self.capacity, self.wait_ms / self.frames,
+                        self.prepare_ms / self.frames, self.pull_ms / self.frames,
+                        self.copy_ms / self.frames, self.convert_ms / self.frames, self.missing_pts)
+
+
+def create_video_capture(path: Path, decoder="auto", prefetch=2, python="/usr/bin/python3", read_ahead=2):
     probe = cv2.VideoCapture(str(path))
     if not probe.isOpened():
         probe.release()
@@ -220,4 +361,13 @@ def create_video_capture(path: Path, decoder="auto", prefetch=2, python="/usr/bi
     reader = GStreamerVideoCapture(path, fps, width, height, expected_frames, parser, python, prefetch)
     logger.info("视频读取：GStreamer / nvv4l2decoder（NVDEC），原图=%sx%s，预读上限=%s 帧，保留 PTS",
                 width, height, prefetch)
+    if read_ahead:
+        try:
+            prepared = PreparedVideoCapture(reader, read_ahead)
+        except BaseException:
+            reader.release()
+            raise
+        logger.info("NVDEC 完整帧预读已启用：最多 %s 帧（含准备中），复制与 BGR 转换在后台执行", read_ahead)
+        return prepared
+    logger.info("NVDEC 完整帧预读关闭：同步准备 BGR，使用上一版路径")
     return reader

@@ -207,8 +207,8 @@ finally:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / '原始 video.mp4'
             subprocess.run(['/usr/bin/python3', '-I', '-c', create_video, str(path)], check=True, timeout=45)
-            for prefetch in (1, 2):
-                reader = create_video_capture(path, 'gstreamer', prefetch)
+            for read_ahead in (0, 1, 2):
+                reader = create_video_capture(path, 'gstreamer', read_ahead=read_ahead)
                 try:
                     pts, means = [], []
                     while True:
@@ -225,7 +225,8 @@ finally:
             reader = create_video_capture(path, 'gstreamer')
             self.assertTrue(reader.read()[0])
             reader.release()
-            self.assertIsNotNone(reader._process.poll())
+            self.assertIsNotNone(reader.source._process.poll())
+            self.assertFalse(reader._thread.is_alive())
 
 
 if __name__ == '__main__':

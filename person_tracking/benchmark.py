@@ -17,7 +17,7 @@ from .engine import PersonTrackingEngine
 from .model_artifacts import artifact_paths
 from .processor import PersonVideoProcessor
 from .types import BoundingBox, bbox_iou
-from .video_reader import GStreamerVideoCapture, create_video_capture
+from .video_reader import GStreamerVideoCapture, PreparedVideoCapture, create_video_capture
 
 
 def timing_summary(values: list[float]) -> dict:
@@ -48,8 +48,8 @@ def run_video(config, limit: int, warmup: int) -> dict:
             if not count:
                 continue
             capture = create_video_capture(config.input_path, config.decoder,
-                                           config.decode_prefetch, config.gst_python)
-            actual_decoder = "gstreamer" if isinstance(capture, GStreamerVideoCapture) else "opencv"
+                                           config.decode_prefetch, config.gst_python, config.read_ahead)
+            actual_decoder = "gstreamer" if isinstance(capture, (GStreamerVideoCapture, PreparedVideoCapture)) else "opencv"
             fps = capture.get(cv2.CAP_PROP_FPS)
             if not np.isfinite(fps) or fps <= 0:
                 raise RuntimeError("输入视频缺少有效帧率")
