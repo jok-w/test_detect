@@ -25,11 +25,13 @@ WORKER = Path(__file__).with_name("gst_decoder_worker.py")
 
 def decoder_parser(path: Path, codec: str) -> str:
     if path.suffix.lower() not in {".mp4", ".mov"}:
-        raise RuntimeError("NVDEC 读取当前支持 MP4/MOV 中的 H.264/H.265")
+        raise RuntimeError("NVDEC 读取当前支持 MP4/MOV 中的 H.264/H.265/MPEG-4 Part 2")
     if codec.lower() in {"hevc", "hvc1", "hev1"}:
         return "h265parse"
     if codec.lower() in {"avc1", "h264", "x264"}:
         return "h264parse"
+    if codec.lower() in {"fmp4", "mp4v", "divx", "dx50", "xvid"}:
+        return "mpeg4videoparse"
     raise RuntimeError(f"NVDEC 读取暂不支持输入编码：{codec!r}")
 
 
@@ -76,6 +78,7 @@ class GStreamerVideoCapture:
         self.missing_pts = 0
         self.pull_ms = self.copy_ms = self.convert_ms = 0.0
         self._closed, self._eos = False, False
+        self._pending_frame = None
         self._process = self._shared = self._memory = self._control = self._log = None
         child = None
         try:
@@ -109,13 +112,29 @@ class GStreamerVideoCapture:
         return not self._closed
 
     def get(self, prop):
+        if self._pending_frame is not None and prop in (cv2.CAP_PROP_POS_MSEC, cv2.CAP_PROP_POS_FRAMES):
+            return float("nan") if prop == cv2.CAP_PROP_POS_MSEC else 0
         return {cv2.CAP_PROP_FPS: self.fps, cv2.CAP_PROP_FRAME_WIDTH: self.width,
                 cv2.CAP_PROP_FRAME_HEIGHT: self.height, cv2.CAP_PROP_FRAME_COUNT: self.expected_frames,
                 cv2.CAP_PROP_POS_MSEC: self.pts_ms, cv2.CAP_PROP_POS_FRAMES: self.frames}.get(prop, 0)
 
+    def prime(self):
+        """Validate actual decoding before committing to NVDEC; retain the first frame/PTS."""
+        if self._pending_frame is not None:
+            return
+        if self.frames:
+            raise RuntimeError("只能在交付首帧前检查硬件解码")
+        ok, frame = self.read()
+        if not ok:
+            raise RuntimeError("硬件解码未产生首帧")
+        self._pending_frame = frame
+
     def read(self):
         if self._closed:
             raise RuntimeError("硬件读取器已关闭")
+        if self._pending_frame is not None:
+            frame, self._pending_frame = self._pending_frame, None
+            return True, frame
         if self._eos:
             return False, None
         try:
@@ -170,6 +189,7 @@ class GStreamerVideoCapture:
         if self._closed:
             return
         self._closed = True
+        self._pending_frame = None
         try:
             if self._process is not None:
                 if self._process.poll() is None:
@@ -341,6 +361,7 @@ def create_video_capture(path: Path, decoder="auto", prefetch=2, python="/usr/bi
     if decoder == "opencv" or (decoder == "auto" and not is_jetson()):
         logger.info("视频读取：OpenCV")
         return probe
+    reader = None
     try:
         if not is_jetson():
             raise RuntimeError("NVDEC 读取需要 Jetson Linux")
@@ -351,14 +372,26 @@ def create_video_capture(path: Path, decoder="auto", prefetch=2, python="/usr/bi
         codec = "".join(chr((fourcc >> (8 * i)) & 255) for i in range(4))
         parser = decoder_parser(path, codec)
         check_decoder(python, parser)
-    except (RuntimeError, ValueError, OverflowError) as error:
+        reader = GStreamerVideoCapture(path, fps, width, height, expected_frames, parser, python, prefetch)
+        # READY/plugin presence does not prove that the stream can be decoded.
+        # Keep the untouched OpenCV capture until a real first frame succeeds.
+        reader.prime()
+    except (RuntimeError, ValueError, OverflowError, OSError, subprocess.SubprocessError) as error:
+        if reader is not None:
+            reader.release()
         if decoder != "auto":
             probe.release()
             raise
         logger.warning("硬件读取不可用，回退 OpenCV：%s", error)
         return probe
+    except BaseException:
+        try:
+            if reader is not None:
+                reader.release()
+        finally:
+            probe.release()
+        raise
     probe.release()
-    reader = GStreamerVideoCapture(path, fps, width, height, expected_frames, parser, python, prefetch)
     logger.info("视频读取：GStreamer / nvv4l2decoder（NVDEC），原图=%sx%s，预读上限=%s 帧，保留 PTS",
                 width, height, prefetch)
     if read_ahead:

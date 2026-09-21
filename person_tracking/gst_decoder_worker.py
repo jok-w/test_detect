@@ -148,7 +148,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
-    parser.add_argument("--parser", choices=("h264parse", "h265parse"), required=True)
+    parser.add_argument("--parser", choices=("h264parse", "h265parse", "mpeg4videoparse"), required=True)
     parser.add_argument("--input")
     parser.add_argument("--control-fd", type=int)
     parser.add_argument("--memory-fd", type=int)

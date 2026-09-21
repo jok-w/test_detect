@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-engine", type=Path, help="默认 <PT名称>.local.engine")
     parser.add_argument("--input", type=Path, required=True, help="输入视频路径")
     parser.add_argument("--decoder", choices=("auto", "opencv", "gstreamer"), default="auto",
-                        help="读取后端：Jetson H.264/H.265 MP4/MOV 优先 NVDEC；Windows 使用 OpenCV")
+                        help="读取后端：Jetson H.264/H.265/MPEG-4 Part 2 MP4/MOV 优先 NVDEC；Windows 使用 OpenCV")
     parser.add_argument("--decode-prefetch", type=int, choices=(1, 2), default=2,
                         help="NVDEC appsink 预读队列上限，默认 2 帧，满时等待、不丢帧")
     parser.add_argument("--read-ahead", type=int, choices=(0, 1, 2), default=2,

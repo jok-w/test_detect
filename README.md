@@ -166,7 +166,9 @@ RUN_JETSON_GSTREAMER_TEST=1 uv run python -m unittest discover -s tests -p test_
 
 ### Jetson NVDEC 硬件读取及有限预读
 
-`--decoder auto|opencv|gstreamer` 控制读取，与模型 `--backend`、输出 `--encoder` 独立。默认 `auto` 在 Jetson 上对 H.264/H.265 的 MP4/MOV 文件优先使用 NVDEC；其他平台、格式或缺少系统依赖时打印原因并使用 OpenCV。强制 `gstreamer` 不可用时报错。解码辅助进程启动后发生错误不会中途回退或重新从头读视频。
+`--decoder auto|opencv|gstreamer` 控制读取，与模型 `--backend`、输出 `--encoder` 独立。默认 `auto` 在 Jetson 上对 H.264/H.265/MPEG-4 Part 2 的 MP4/MOV 文件优先使用 NVDEC；其他平台、格式或缺少系统依赖时使用 OpenCV，硬件检查失败会打印原因。MPEG-4 Part 2 支持 `FMP4`、`mp4v`、`DIVX`、`DX50`、`XVID` 标识，通过 `mpeg4videoparse` 解析；这些标识不代表 H.264，也不会自动放开 AVI 等其他容器。
+
+启动时会实际解码并缓存首帧，确认当前设备和插件能处理输入视频。`auto` 在插件检查、硬件初始化或首帧解码失败时清理硬件资源并回退到尚未读取的 OpenCV 输入；强制 `gstreamer` 则直接报错。首帧成功后按原顺序交付缓存图像及其 PTS，不丢帧、不重复；后续解码错误不会中途回退或重新从头读视频。首帧验证属于初始化，不计入主流程处理 FPS；解码器分项统计仍包含该帧的解码、复制和转换耗时。
 
 ```bash
 uv run python -m person_tracking \
